@@ -529,6 +529,22 @@ def save_ckpt(
 
     torch.save(ckpt, file_path)
 
+def modules_are_equal(module_1, module_2):
+    state_dict1 = module_1.state_dict()
+    state_dict2 = module_2.state_dict()
+    print(f"state_dict1 keys = {list(state_dict1.keys())}")
+    print(f"state_dict2 keys = {list(state_dict2.keys())}")
+
+    is_equal = True
+    for key in state_dict1:
+        if key in state_dict2:
+            if not torch.equal(state_dict1[key], state_dict2[key]):
+                is_equal = False
+
+    
+    return is_equal
+
+
 
 import optuna
 from sklearn.metrics._scorer import _PredictScorer
@@ -537,14 +553,24 @@ from sklearn.metrics._scorer import _PredictScorer
 class OptunaHPO:
     def __init__(self, n_trials=5, n_jobs=-1, sampler=None):
         self.n_trials = n_trials
-        self.n_jobs = n_jobs
-        self.sampler = sampler
+        self.n_jobs   = n_jobs
+        self.sampler  = sampler
+        self.best_model     = None
+        self.best_val_score = None
+        self.train_val_metadata = {
+            "train_losses" : None,
+            "val_losses"   : None,
+            "val_scores"   : None
+        }
 
     def get_params(self):
         return {
             "n_trials": self.n_trials,
             "n_jobs": self.n_jobs,
             "sampler": self.sampler,
+            "best_model" : self.best_model,
+            "best_val_score": self.best_val_score
+
         }
 
     def train_and_validate(
@@ -573,7 +599,32 @@ class OptunaHPO:
                 n_epochs=None,
             )
 
-            return val_scores[-1]
+            val_score = val_scores[-1]
+            print(f"VAL SCORE = {val_score}")
+
+            if self.best_val_score is None:
+                self.best_model = gnn_trainer.model
+                self.best_val_score = val_score
+                self.train_val_metadata = {
+                    "train_losses" : train_losses,
+                    "val_losses"   : val_losses,
+                    "val_scores"   : val_scores
+                }
+                # print("best_val_score = ", self.best_val_score)                
+            elif val_score > self.best_val_score:
+                
+                print(f"\n*** We have a better model with val_score = {val_score} (> {self.best_val_score}) ***\n")
+                print(f"modules_are_equal ={modules_are_equal(self.best_model,gnn_trainer.model)}\n")
+                self.best_model = gnn_trainer.model
+                self.best_val_score = val_score
+                self.train_val_metadata = {
+                    "train_losses" : train_losses,
+                    "val_losses"   : val_losses,
+                    "val_scores"   : val_scores
+                }
+
+
+            return val_score
             # return val_losses[-1]
         else:
             raise NotImplementedError("train_validate is only implemented for the 'classic' split mode.")
@@ -653,6 +704,9 @@ class OptunaHPO:
                 split_mode=split_mode,
             )
             # print('val_score', val_score)
+
+
+
             return val_score
 
         else:
@@ -687,13 +741,16 @@ class OptunaHPO:
             **kwargs,
         )
 
+        objective.best_model = None
+        objective.best_score  = None
+
         self.study.optimize(
             objective, n_trials=self.n_trials, n_jobs=self.n_jobs, gc_after_trial=True
         )
 
         results = {
             "best_params": self.study.best_params,
-            "best_score": self.study.best_value
+            "best_score": self.study.best_value,
             # , "gnn_type": gnn_model.__class__.__name__
         }
 
