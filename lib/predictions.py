@@ -7,6 +7,7 @@ from torch import cat, tensor
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+import inspect
 
 from lib import datasets, gnn_utils, graph_nns, datasets, featurizers as feat
 from lib.featurizers import (
@@ -23,7 +24,14 @@ def predict_from_batch(batch, model, return_true_targets: bool = False):
         batch.x = batch.x.float()
         # output = model(batch)
         global_feats = batch.to_dict().get("global_feats", None)
-        output = model(batch.x, batch.edge_index, batch.batch, global_feats)
+
+        if not 'edge_attr' in inspect.signature(model.forward).parameters:
+            output = model(x=batch.x, edge_index=batch.edge_index, batch=batch.batch, global_feats=global_feats)
+        else:
+            edge_attr_ = batch.to_dict().get('edge_attr', None)
+            # print(f"edge_attr = {edge_attr_.shape or None}")
+            output = model(x=batch.x, edge_index=batch.edge_index, batch=batch.batch
+                            , global_feats=global_feats, edge_attr=batch.to_dict().get("edge_attr", None))
 
     if return_true_targets:
         # print(batch.y)
