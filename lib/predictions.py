@@ -8,6 +8,7 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import inspect
+import warnings
 
 from lib import datasets, gnn_utils, graph_nns, datasets, featurizers as feat
 from lib.featurizers import (
@@ -18,20 +19,23 @@ from lib.featurizers import (
 )
 
 
-def predict_from_batch(batch, model, return_true_targets: bool = False):
+def predict_from_batch(batch:Batch, model:graph_nns.MyGNN, return_true_targets: bool = False):
+    
     output = None
-    if type(model) in [graph_nns.GCN, graph_nns.GAT, graph_nns.GIN]:
-        batch.x = batch.x.float()
-        # output = model(batch)
-        global_feats = batch.to_dict().get("global_feats", None)
+    assert isinstance(model,graph_nns.MyGNN), f"ValueError: The current model of class {model.__class__} is not a subclass of graph_nns.MyGNN."
 
-        if not 'edge_attr' in inspect.signature(model.forward).parameters:
-            output = model(x=batch.x, edge_index=batch.edge_index, batch=batch.batch, global_feats=global_feats)
-        else:
-            edge_attr_ = batch.to_dict().get('edge_attr', None)
-            # print(f"edge_attr = {edge_attr_.shape or None}")
-            output = model(x=batch.x, edge_index=batch.edge_index, batch=batch.batch
-                            , global_feats=global_feats, edge_attr=batch.to_dict().get("edge_attr", None))
+    batch.x = batch.x.float()
+    # output = model(batch)
+    global_feats = batch.to_dict().get("global_feats", None)
+
+    if not 'edge_attr' in inspect.signature(model.forward).parameters:
+        output = model(x=batch.x, edge_index=batch.edge_index, batch=batch.batch, global_feats=global_feats)
+    else:
+        edge_attr_ = batch.to_dict().get('edge_attr', None)
+        # print(f"edge_attr = {edge_attr_.shape or None}")
+        output = model(x=batch.x, edge_index=batch.edge_index, batch=batch.batch
+                        , global_feats=global_feats, edge_attr=batch.to_dict().get("edge_attr", None))
+
 
     if return_true_targets:
         # print(batch.y)
@@ -40,8 +44,8 @@ def predict_from_batch(batch, model, return_true_targets: bool = False):
         return output, None
 
 
-def predict_from_loader(
-    model, loader, device="cpu", return_true_targets: bool = False, desc="Predicting..."
+def predict_from_loader(model:graph_nns.MyGNN, loader:DataLoader, device: str = "cpu"
+                        , return_true_targets: bool = False, desc:str = "Predicting..."
 ):
     pred_target = torch.empty((0,), dtype=torch.float32).to(device)
     # outputs = torch.empty((0,model.out_neurons), dtype=torch.float32).to(device)
@@ -84,75 +88,135 @@ def predict_from_loader(
         return pred_target
 
 
-def predict_from_data_list(
-    data: Union[Data, List[Data]],
-    batch_size=128,
-    device="cpu",
-    shuffle: bool = False,
-    add_global_feats_to_nodes: bool = False,
-    num_workers: int = 0,
-    scale_features: bool = True,
-    feature_scaler=MinMaxScaler(),
-    desc="Predicting...",
+def predict_from_loader(
+    model:graph_nns.MyGNN,
+    loader:DataLoader,
+    device: str="cpu",
+    return_true_targets: bool = False,
+    desc:str ="Predicting...",
 ):
+    pred_target = torch.empty((0,), dtype=torch.float32).to(device)
+    # outputs = torch.empty((0,model.out_neurons), dtype=torch.float32).to(device)
+    true_target = torch.empty((0,), dtype=torch.float32).to(device)
+    exportable_y = False
+
+    # print("device = ", device)
+    # print(loader)
+    first_batch = None
+    for b in loader:
+        # print("b= ", b)
+        # print(dir(b))
+        first_batch = b.to(device)
+        break
+    # first_batch = next(iter(loader)) #.to(device)
+    # print(first_batch)
+
+    if return_true_targets and hasattr(first_batch, "y"):
+        exportable_y = True
+        # print("exportable_y = True")
+
+    task = model.task
+    model = model.to(device)
+
+    for data in loader:
+        # for data in tqdm(loader, desc=desc): #
+        # data   = data.to(device)
+
+        output, true_y = predict_from_batch(
+            batch=data.to(device), model = model, return_true_targets=return_true_targets
+        )
+
+        if task in ["binary_classification"]:
+            pred_target = cat((pred_target, output), dim=0)
+        elif task == "multilabel_classification":
+            _, predicted = torch.max(
+                output, 1
+            )  ## returns maximum values(_), and their indices (predicted) along the dimmension 1
+            pred_target = cat((pred_target, predicted), dim=0)
+
+        elif task == "regression":
+            pred_target = cat((pred_target, output.float()), dim=0)
+        else:
+            raise ValueError(f"No implementation for task {task}.")
+        # outputs = cat((outputs, output), dim=0)
+
+        if exportable_y:
+            true_target = cat((true_target, true_y.float()), dim=0)
+
+    if return_true_targets:
+        return pred_target, true_target
+    else:
+        return pred_target
+
+def predict_from_data_list(
+    model:graph_nns.MyGNN,
+    data: Union[Data, List[Data]],
+    add_global_feats_to_nodes:bool = False,
+    batch_size: int=128,
+    device: str="cpu",
+    shuffle: bool=False,
+    num_workers: int = 0,
+    return_true_targets: bool = False,
+
+    desc: str="Predicting...",
+):
+
+    print("add_global_feats_to_nodes", add_global_feats_to_nodes)
+    if add_global_feats_to_nodes and (not hasattr(data[0], 'global_feats')):
+        x_dim = model.in_channels
+        print(f"data[0].x.shape[1] = {data[0].x.shape[1]}  / x_dim = {x_dim}", )
+        if data[0].x.shape[1] == x_dim:
+            warnings.warn("\n\n*******************************At least one data item does not have a global_feats. However, the x parameter has a size of {data[0].x.shape[1]}, which is equal to the expected value of {x_dim}. So we suppose global features have been added already.\nThe global feature addition step will be skipped.\n*******************************")
+            add_global_feats_to_nodes = False
+        else:
+            raise Exception(f"\n\n*******************************There are no features to add. The current x attribute of size {data[0].x.shape[1]} indicates that no features were added to the original {x_dim} node features features.")
+    
     loader = None
     if isinstance(data, List):
         loader = datasets.get_dataloader(
             dataset=data,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             add_global_feats_to_nodes=add_global_feats_to_nodes,
+            # add_global_feats_to_nodes=False,
             num_workers=num_workers,
-            scale_features=scale_features,
-            feature_scaler=feature_scaler,
         )
 
     elif isinstance(data, Data):
         loader = datasets.get_dataloader(
             dataset=[data],
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             add_global_feats_to_nodes=add_global_feats_to_nodes,
+            # add_global_feats_to_nodes=False,
             num_workers=num_workers,
-            scale_features=scale_features,
-            feature_scaler=feature_scaler,
         )
     else:
         raise TypeError(
             "data must be an instance of the following classes: Data, or List[Data]."
         )
 
-    return self.predict_from_loader(loader, device=device, desc=desc)
+    print("loader: ", next(iter(loader)))
 
-
-# def predict_from_data_list(self, data:Union[Data, List[Data]], batch_size=128, device='cpu'
-#                         , desc="Predicting..."):
-#     loader = None
-#     if isinstance(data, List):
-#         loader = DataLoader(dataset=data, batch_size=batch_size)
-#     elif isinstance(data, Data):
-#         loader = DataLoader(dataset=[data], batch_size=batch_size)
-#     else:
-#         raise TypeError("data must be an instance of the following classes: Data, or List.")
-
-#     return self.predict_from_loader(loader, device=device, desc=desc)
+    # print("loader", list(loader))
+    return predict_from_loader(model=model,
+        loader=loader, device=device, return_true_targets=return_true_targets, desc=desc
+    )
 
 
 def predict_from_smiles_list(
+    model:graph_nns.MyGNN,
     smiles_list: List[str],
-    batch_size=128,
-    device="cpu",
-    shuffle=False,
+    batch_size:int =128,
+    device: str="cpu",
+    add_explicit_h: bool=False,
+    atom_featurizer:AtomFeaturizer = feat.ATOM_FEATURIZER,
+    bond_featurizer:AtomFeaturizer = feat.BOND_FEATURIZER,
+    mol_featurizer:AtomFeaturizer  = feat.MoleculeFeaturizer(),
+    add_global_feats_to_nodes:bool = False,
+    shuffle: bool=False,
     num_workers: int = 0,
-    atom_featurizer: AtomFeaturizer = feat.ATOM_FEATURIZER,
-    bond_featurizer: BondFeaturizer = feat.BOND_FEATURIZER,
-    mol_featurizer: feat.MoleculeFeaturizer = feat.MoleculeFeaturizer(),
-    add_explicit_h: bool = True,
-    compute_global_features: bool = True,
-    add_global_feat_to_nodes: bool = False,
-    scale_features: bool = True,
-    feature_scaler=MinMaxScaler(),
-    desc="Predicting...",
+    desc: str="Predicting...",
 ):
     graphs = gnn_utils.graph_from_smiles_list(
         smiles_list,
@@ -160,21 +224,21 @@ def predict_from_smiles_list(
         atom_featurizer=atom_featurizer,
         bond_featurizer=bond_featurizer,
         mol_featurizer=mol_featurizer,
-        compute_global_features=compute_global_features,
-        add_global_feat_to_nodes=add_global_feat_to_nodes,
     )
 
-    return self.predict_from_data_list(
-        graphs,
+    return predict_from_data_list(
+        model=model,
+        data=graphs,
+        add_global_feats_to_nodes = add_global_feats_to_nodes,
         batch_size=batch_size,
         device=device,
         shuffle=shuffle,
-        add_global_feats_to_nodes=add_global_feats_to_nodes,
         num_workers=num_workers,
-        scale_features=scale_features,
-        feature_scaler=feature_scaler,
         desc=desc,
     )
+
+
+
 
 
 class GNNPredictor:
@@ -238,6 +302,7 @@ class GNNPredictor:
         # print(loader)
         first_batch = None
         for b in loader:
+            # print("b= ", b)
             # print(dir(b))
             first_batch = b.to(device)
             break
@@ -284,23 +349,56 @@ class GNNPredictor:
     def predict_from_data_list(
         self,
         data: Union[Data, List[Data]],
+        add_global_feats_to_nodes:bool = None,
         batch_size=128,
         device="cpu",
         shuffle=False,
         num_workers: int = 0,
         return_true_targets: bool = False,
+
         desc="Predicting...",
     ):
+        if add_global_feats_to_nodes is None:
+            add_global_feats_to_nodes=self.add_global_feats_to_nodes
+
+        print("add_global_feats_to_nodes", add_global_feats_to_nodes)
+        
+        has_global_feats      = True
+        current_num_feats_x   = None 
+        x_dim = self.model.in_channels
+
+        if isinstance(data, List):
+            has_global_feats = hasattr(data[0], 'global_feats')
+            current_num_feats_x = data[0].x.shape[1]
+
+
+        else:
+            has_global_feats = hasattr(data, 'global_feats')
+            current_num_feats_x = data.x.shape[1]
+
+        # print("current_x_size = " {current_x_size})
+
+        if add_global_feats_to_nodes and not has_global_feats:
+            
+            print(f"current_num_feats_x = {current_num_feats_x}  / x_dim = {x_dim}", )
+            if current_num_feats_x == x_dim:
+                warnings.warn("\n\n*******************************At least one data item does not have a global_feats. However, the x parameter has a size of {current_num_feats_x}, which is equal to the expected value of {x_dim}. So we suppose global features have been added already.\nThe global feature addition step will be skipped.\n*******************************")
+                add_global_feats_to_nodes = False
+            elif current_num_feats_x < x_dim:
+                raise Exception(f"\n\n*******************************There are no features to add. The current x attribute of size {current_num_feats_x} indicates that no features were added to the original {x_dim} node features features.")
+            else:
+                raise Exception(f"\n\n******************************* Current number of features ({current_num_feats_x}) exceeds the expected number ({x_dim}).")
+
+
         loader = None
         if isinstance(data, List):
             loader = datasets.get_dataloader(
                 dataset=data,
                 batch_size=batch_size,
                 shuffle=False,
-                add_global_feats_to_nodes=self.add_global_feats_to_nodes,
+                add_global_feats_to_nodes=add_global_feats_to_nodes,
+                # add_global_feats_to_nodes=False,
                 num_workers=num_workers,
-                scale_features=self.scale_features,
-                feature_scaler=self.feature_scaler,
             )
 
         elif isinstance(data, Data):
@@ -308,15 +406,16 @@ class GNNPredictor:
                 dataset=[data],
                 batch_size=batch_size,
                 shuffle=False,
-                add_global_feats_to_nodes=self.add_global_feats_to_nodes,
+                add_global_feats_to_nodes=add_global_feats_to_nodes,
+                # add_global_feats_to_nodes=False,
                 num_workers=num_workers,
-                scale_features=self.scale_features,
-                feature_scaler=self.feature_scaler,
             )
         else:
             raise TypeError(
                 "data must be an instance of the following classes: Data, or List[Data]."
             )
+
+        print("loader: ", next(iter(loader)))
 
         # print("loader", list(loader))
         return self.predict_from_loader(

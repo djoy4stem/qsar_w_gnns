@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch import cat, tensor
 import torch.nn.init as init
-from torch_geometric.nn import GCNConv, Linear, GATv2Conv, GINConv
+from torch_geometric.nn import GCNConv, Linear, GATv2Conv, GINConv, MessagePassing
 from torch_geometric.data import DataLoader, Data
 from torch_geometric.nn import global_mean_pool, global_add_pool, global_max_pool
 import torch.nn.functional as Fun
@@ -36,12 +36,113 @@ _allowable_pooling_funcs = ["mean", "sum", "max"]
 
 
 
+def reset_params(object_:nn.Module, init_type='kaiming_normal'):
 
-class GCN(nn.Module):
+    itype=init_type
+
+    if itype is None:
+        if isinstance(object_, (Sigmoid, Softmax)):
+            itype="kaiming_normal"
+        if isinstance(object_, (ReLU)):
+            itype="xavier_normal"       
+        
+    for param in object_.parameters():
+        if param.dim() == 1: ## This usually represent the bias term
+            nn.init.constant_(param, 0)
+        else:
+            if itype == "kaiming_normal":
+                init.kaiming_normal_(layer_.weight, nonlinearity='leaky_relu') ## 'leaky_relu' is the default
+            if itype == "kaiming_uniform":
+                init.kaiming_uniform_(layer_.weight, nonlinearity='leaky_relu') ## 'leaky_relu' is the default
+            elif itype == 'xavier_normal':
+                init.xavier_normal_(layer_.weight)
+            elif itype == 'xavier_uniform':
+                init.xavier_uniform_(layer_.weight)
+            elif itype == 'normal':
+                init.normal_(layer_.weight, mean=0.0, std=0.02)
+
+             
+
+class MyGNN(nn.Module):
+    def __init__(self, 
+                    task: str,
+                    in_channels:int,
+                    gnn_hidden_neurons: int = 128,
+                    gnn_nlayers: int = 2,
+                    global_fdim: int = None, 
+                    out_neurons: int = 1,
+                    dropout_rate: float = 0.3,                   
+                    activation_func: object = torch.nn.ReLU(),
+                    init_type: str = None
+                                     
+                ):
+        
+        super(MyGNN, self).__init__()
+        assert (
+            task.lower() in _allowable_tasks
+        ), f"The task must be either of the following: {'; '.join(_allowable_tasks)}."
+
+
+        self.task = task.lower()
+        self.in_channels = in_channels
+        self.gnn_dim = gnn_hidden_neurons
+        self.gnn_nlayers = gnn_nlayers
+        self.global_fdim = global_fdim
+
+        self.out_neurons = out_neurons
+        self.dropout_rate = dropout_rate
+        self.activation_func = activation_func
+        if isinstance(self.activation_func, str):
+            self.activation_func = eval(f"{self.activation_func}()")
+
+        self.init_type = init_type
+
+        if self.task in ['binary_classification', 'multiclass_classification']:
+            self.classification_out_layer = None
+
+
+    def initialize_params(self, init_type='xavier'):
+        """
+  
+        Initializations:
+        1) Xavier initialization initializes the weights with a normal distribution with mean 0 and variance of sqrt(1/n)
+            , where n is the number of neurons in the previous layer. This is used for the sigmoid, tanh, or softmax activation function. Alternatively,
+            it can also initialize weights with a uniform distribution. This is used for ReLU or linera activation.
+
+        2) Kaiming (or He) inititialization either initializes the weights with a normal distribution with mean 0 and 
+            variance of sqrt(2/n), where n is the number of neurons in the previous layer. This is used for the 
+            ReLU activation function, or with a uniform distribution
+
+        3) Normal initialization initializes the weights with values drawn from a normal distribution with mean 0 and 
+        standard deviation, which is typically set to 0.01.
+        """
+
+        print("Initializing parameters...")
+        # print(f"Num modules : {len(list(self.modules()))}")
+
+        for my_module_ in self.modules(): ## self.modules() is the object itself and does not have reset params
+            # print("Module: ", my_module_.__class__)
+
+            if hasattr(my_module_, 'reset_parameters'):
+                my_module_.reset_parameters()
+            else:
+                reset_params(my_module_, init_type='kaiming')
+
+
+    def set_global_pooling_func(self, gpooling_func):
+        if gpooling_func == "mean":
+            self.global_pooling = global_mean_pool
+        elif gpooling_func == "sum":
+            self.global_pooling = global_add_pool
+        elif gpooling_func == "max":
+            self.global_pooling = global_max_pool
+
+
+class GCN(MyGNN):
     def __init__(
         self,
         task: str,
-        in_channels,
+        in_channels:int,
         gnn_hidden_neurons: int = 128,
         gnn_nlayers: int = 2,
         global_fdim: int = None,
@@ -52,49 +153,32 @@ class GCN(nn.Module):
         gpooling_func: str = "mean",
         activation_func: object = torch.nn.ReLU(),
         add_batch_norm: bool = False,
+        init_type: str = None
     ):
-        super(GCN, self).__init__()
+        super(GCN, self).__init__(task, in_channels, gnn_hidden_neurons, gnn_nlayers
+                                    , global_fdim, out_neurons, dropout_rate
+                                    , activation_func, init_type)
 
-        assert (
-            task.lower() in _allowable_tasks
-        ), f"The task must be either of the following: {'; '.join(_allowable_tasks)}."
+
         assert (
             gpooling_func.lower() in _allowable_pooling_funcs
         ), "The global poling function must be either of the following: {'; '.join(_allowable_pooling_funcs)}."
 
-        self.task = task.lower()
-        self.in_channels = in_channels
-        self.gnn_dim = gnn_hidden_neurons
-        self.gnn_nlayers = gnn_nlayers
-        self.global_fdim = global_fdim
+
         self.ffn_dim = ffn_hidden_neurons
         self.ffn_nlayers = ffn_nlayers
         self.out_neurons = out_neurons
-        self.dropout_rate = dropout_rate
-        self.activation_func = activation_func
-        if isinstance(self.activation_func, str):
-            self.activation_func = eval(f"{self.activation_func}()")
-        self.add_batch_norm = add_batch_norm
 
         self.set_global_pooling_func(gpooling_func)
+        self.add_batch_norm = add_batch_norm
 
         self.create_layers()
-        self.initialize_params()
+        self.initialize_params(init_type=self.init_type)
 
-    def initialize_params(self):
-        print("Initializing parameters...")
-        for layer_ in self.modules():
-            # print(layer_.__class__)
-            if isinstance(layer_, GCNConv):
-                layer_.reset_parameters()
-            if isinstance(layer_, Linear):
-                # print(f"\t{layer_.weight.shape}")
-                init.xavier_uniform_(layer_.weight)
-                init.zeros_(layer_.bias)
 
     @classmethod
     def from_dict(cls, params: dict):
-        print("params = ", params)
+        # print("params = ", params)
         task = params.get("task").lower()
         in_channels = params.get("in_channels")
         gnn_hidden_neurons = params.get("gnn_hidden_neurons", 128)
@@ -124,13 +208,6 @@ class GCN(nn.Module):
             add_batch_norm=add_batch_norm,
         )
 
-    def set_global_pooling_func(self, gpooling_func):
-        if gpooling_func == "mean":
-            self.global_pooling = global_mean_pool
-        elif gpooling_func == "sum":
-            self.global_pooling = global_add_pool
-        elif gpooling_func == "max":
-            self.global_pooling = global_max_pool
 
     def create_layers(self):
         # print('self.in_channels', self.in_channels)
@@ -221,17 +298,9 @@ class GCN(nn.Module):
     def forward(self, x, edge_index, batch, global_feats=None):
         # print("data", data)
         x = x.float()
-        # print(f"data.__dict__: {data.__dict__}")
-        # print()
-        # global_feats = data.global_feats if 'global_feats' in data.to_dict() else None
-        # print(x.shape)
-
-        # x_input = None
-        # if add_skip_connection:
-        #     ## Input for the skip connection
-        #     x_input = x.clone()
 
         # print('global_feats is None ', global_feats is None)
+        # print(x.shape, edge_index.shape)
         x = self.conv1(x, edge_index)
         x = self.activation_func(x)
         # print(f'after conv1: {x is None}')
@@ -277,8 +346,40 @@ class GCN(nn.Module):
 
         return x
 
+    def get_embedding(self, data):
+        # print("data", data)
+        x, edge_index, edge_attr, dbatch = (
+            data.x.float(),
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+        global_feats = data.global_feats if "global_feats" in data.to_dict() else None
 
-class GAT(nn.Module):
+        x = self.conv1(x, edge_index)
+        x = self.activation_func(x)
+
+        for gconvo in self.convs:
+            x = gconvo(x, edge_index)
+            x = self.activation_func(x)
+
+        # print("self.global_pooling(x, dbatch) = ", self.global_pooling(x, dbatch).shape)
+        
+        if global_feats is None:
+            return self.global_pooling(x, dbatch)
+
+        else:
+            
+            all_feats = cat(
+                [self.global_pooling(x, dbatch), global_feats], dim=1
+            ).float()      
+            # print("ALL: ", all_feats)   
+            return  all_feats
+
+        return x
+
+
+class GAT(MyGNN):
     def __init__(
         self,
         task: str,
@@ -296,57 +397,37 @@ class GAT(nn.Module):
         gpooling_func: str = "mean",
         activation_func=ReLU(),
         add_batch_norm: bool = False,
-        add_edge_features: bool = False,
+        add_edge_features: bool = True,
+        init_type: str = None
     ):
-        super(GAT, self).__init__()
+        super(GAT, self).__init__(task, in_channels, gnn_hidden_neurons, gnn_nlayers
+                                    , global_fdim, out_neurons, dropout_rate
+                                    , activation_func, init_type)
 
         assert (
-            task.lower() in _allowable_tasks
-        ), "The task must be either of the following: {'; '.join(_allowable_tasks)}."
+            gpooling_func.lower() in _allowable_pooling_funcs
+        ), "The global poling function must be either of the following: {'; '.join(_allowable_pooling_funcs)}."
+
+
         assert not (
             add_edge_features and edge_dim is None
         ), "Adding edge features requires to set edge_dim to a non-null value. However, edge_dim is None."
 
-        self.task = task.lower()
-        self.in_channels = in_channels
-        self.gnn_dim = gnn_hidden_neurons
-        self.gnn_nlayers = gnn_nlayers
-        self.global_fdim = global_fdim
+
         self.edge_dim = edge_dim
         self.heads = heads
         self.ffn_dim = ffn_hidden_neurons
         self.ffn_nlayers = ffn_nlayers
-        self.out_neurons = out_neurons
-        self.dropout_rate = dropout_rate
-        self.attn_dropout_rate = attn_dropout_rate
-        self.activation_func = activation_func
-        self.add_edge_features = add_edge_features
-        if isinstance(self.activation_func, str):
-            self.activation_func = eval(f"{self.activation_func}()")
 
+        self.attn_dropout_rate = attn_dropout_rate
+        self.add_edge_features = add_edge_features
+ 
+        self.set_global_pooling_func(gpooling_func)
         self.add_batch_norm = add_batch_norm
 
-        if gpooling_func == "mean":
-            self.global_pooling = global_mean_pool
-        elif gpooling_func == "sum":
-            self.global_pooling = global_add_pool
-        elif gpooling_func == "max":
-            self.global_pooling = global_max_pool
-
         self.create_layers()
-        self.initialize_params()
-        # print(f"self.conv1 = \n{self.conv1}")
+        self.initialize_params(init_type=self.init_type)
 
-    def initialize_params(self):
-        print("Initializing parameters...")
-        for layer_ in self.modules():
-            # print(layer_.__class__)
-            if isinstance(layer_, GCNConv):
-                layer_.reset_parameters()
-            if isinstance(layer_, Linear):
-                # print(f"\t{layer_.weight.shape}")
-                init.xavier_uniform_(layer_.weight)
-                init.zeros_(layer_.bias)
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -387,42 +468,6 @@ class GAT(nn.Module):
             add_edge_features=add_edge_features,
         )
 
-    def set_global_pooling_func(self, gpooling_func):
-        if gpooling_func == "mean":
-            self.global_pooling = global_mean_pool
-        elif gpooling_func == "sum":
-            self.global_pooling = global_add_pool
-        elif gpooling_func == "max":
-            self.global_pooling = global_max_pool
-
-
-    # def create_conv_layer_sequence(self, dim_in, dim_out, heads, dropout_rate, seq_len=1):
-
-    #     if self.add_edge_features:
-    #         return ModuleList(
-    #                             [GATv2Conv(
-    #                                         dim_in,
-    #                                         dim_out,
-    #                                         edge_dim=self.edge_dim,
-    #                                         heads=heads,
-    #                                         dropout=attn_dropout_rate
-    #                                     )
-
-    #                             for x in range(seq_len)
-    #                             ])
-                                
-    #     else:
-    #         return ModuleList(
-    #                             [GATv2Conv(
-    #                                         dim_in,
-    #                                         dim_out,
-    #                                         heads=heads,
-    #                                         dropout=attn_dropout_rate
-    #                                     )
-
-    #                             for x in range(seq_len)
-    #                             ])            
-
 
     def create_layers(self):
         if self.task in ["binary_classification"]:
@@ -437,8 +482,8 @@ class GAT(nn.Module):
                 edge_dim=self.edge_dim,
                 heads=self.heads,
                 dropout=self.attn_dropout_rate,
-                # concat = True,
-                # negative_slope=0.2
+                concat = True, # default
+                negative_slope=0.2 # default
             )
         else:
             self.conv1 = GATv2Conv(
@@ -446,8 +491,8 @@ class GAT(nn.Module):
                 out_channels = self.gnn_dim,
                 heads=self.heads,
                 dropout=self.attn_dropout_rate,
-                # concat = True,
-                # negative_slope=0.2
+                concat = True, # default
+                negative_slope=0.2 # default
             )
 
         # If there are more than one graph convolutional layers.
@@ -462,8 +507,8 @@ class GAT(nn.Module):
                         edge_dim=self.edge_dim,
                         heads=self.heads,
                         dropout=self.attn_dropout_rate,
-                        # concat = True,
-                        # negative_slope=0.2
+                        concat = True, # default
+                        negative_slope=0.2 # default
                     )
                     for x in range(self.gnn_nlayers - 1)
                 ]
@@ -477,8 +522,8 @@ class GAT(nn.Module):
                         out_channels = self.gnn_dim,
                         heads=self.heads,
                         dropout=self.attn_dropout_rate,
-                        # concat = True,
-                        # negative_slope=0.2
+                        concat = True, # default
+                        negative_slope=0.2 # default
                     )
                     for x in range(self.gnn_nlayers - 1)
                 ]
@@ -564,13 +609,8 @@ class GAT(nn.Module):
             )  # bias specivies whether to include a bias term (Output = Input X Weight + Bias) or no. Adding this offset provides more flexibility for fitting the data
 
     def forward(self, x, edge_index, batch, global_feats=None, edge_attr=None):
-        # def forward(self, data):
-        # print("data", data)
-        # x, edge_index, edge_attr, dbatch = data.x.float(), data.edge_index, data.edge_attr, data.batch
-        # global_feats = data.global_feats if 'global_feats' in data.to_dict() else None
-        
-        # print("x size = ", x.shape)
-        # x = Dropout(p=self.dropout_rate, inplace=False)(x)
+
+        x=x.float()
         if self.add_edge_features and not edge_attr is None:
             x = self.conv1(x, edge_index, edge_attr=edge_attr)
         else:
@@ -637,7 +677,6 @@ class GAT(nn.Module):
         )
         global_feats = data.global_feats if "global_feats" in data.to_dict() else None
 
-        # x = Dropout(p=self.dropout_rate, inplace=False)(x)
         if self.add_edge_features:
             x = self.conv1(x, edge_index, edge_attr=edge_attr)
         else:
@@ -665,7 +704,7 @@ class GAT(nn.Module):
         return x
 
 
-class GIN(nn.Module):
+class GIN(MyGNN):
     def __init__(
         self,
         task: str,
@@ -679,43 +718,26 @@ class GIN(nn.Module):
         dropout_rate: float = 0.3,
         gpooling_func: str = "sum",
         activation_func: [str, object] = torch.nn.LeakyReLU(),
+        init_type: str = None
     ):
-        super(GIN, self).__init__()
+        super(GIN, self).__init__(task, in_channels, gnn_hidden_neurons, gnn_nlayers
+                                    , global_fdim, out_neurons, dropout_rate
+                                    , activation_func, init_type)
 
-        assert (
-            task.lower() in _allowable_tasks
-        ), "The task must be either of the following: {'; '.join(_allowable_tasks)}."
         assert (
             gpooling_func.lower() in _allowable_pooling_funcs
         ), "The global poling function must be either of the following: {'; '.join(_allowable_pooling_funcs)}."
 
-        self.task = task.lower()
-        self.in_channels = in_channels
-        self.gnn_dim = gnn_hidden_neurons
-        self.global_fdim = global_fdim
-        self.gnn_nlayers = gnn_nlayers
         self.ffn_dim = ffn_hidden_neurons
         self.ffn_nlayers = ffn_nlayers
         self.out_neurons = out_neurons
-        self.dropout_rate = dropout_rate
-        self.activation_func = activation_func
-        if isinstance(self.activation_func, str):
-            self.activation_func = eval(f"{self.activation_func}()")
+
 
         self.set_global_pooling_func(gpooling_func)
-        self.create_layers()
-        self.initialize_params
 
-    def initialize_params(self):
-        print("Initializing parameters...")
-        for layer_ in self.modules():
-            # print(layer_.__class__)
-            if isinstance(layer_, GCNConv):
-                layer_.reset_parameters()
-            if isinstance(layer_, Linear):
-                # print(f"\t{layer_.weight.shape}")
-                init.xavier_uniform_(layer_.weight)
-                init.zeros_(layer_.bias)
+        self.create_layers()
+        self.initialize_params(init_type=self.init_type)
+
 
     @classmethod
     def from_dict(cls, params: dict):
@@ -745,13 +767,6 @@ class GIN(nn.Module):
             gpooling_func=gpooling_func,
         )
 
-    def set_global_pooling_func(self, gpooling_func):
-        if gpooling_func == "mean":
-            self.global_pooling = global_mean_pool
-        elif gpooling_func == "sum":
-            self.global_pooling = global_add_pool
-        elif gpooling_func == "max":
-            self.global_pooling = global_max_pool
 
     def create_layers(self):
         if self.task in ["binary_classification"]:
@@ -840,14 +855,7 @@ class GIN(nn.Module):
                 self.ffn_dim, self.out_neurons, bias=True
             )  # bias specivies whether to include a bias term (Output = Input X Weight + Bias) or no. Adding this offset provides more flexibility for fitting the data
 
-    def reset_parameters(self):
-        self.conv1.reset_parameters()
-        for conv in self.convs:
-            conv.reset_parameters()
-        for f in self.ffn:
-            if f.__class__.__name__ == "Linear":
-                f.reset_parameters()
-        self.final.reset_parameters()
+
 
     def forward(self, x, edge_index, batch, global_feats=None):
         # def forward(self, data):
@@ -855,8 +863,11 @@ class GIN(nn.Module):
 
         # x, edge_index, dbatch = data.x, data.edge_index, data.batch
         # global_feats = data.global_feats if 'global_feats' in data.to_dict() else None
+        # print(x.shape, edge_index.shape)
 
-        ## Node embeddings
+        x=x.float()
+
+        ## Node embeddings        
         x = self.conv1(x, edge_index)
         # print(f"x[0] = {x[0].shape}")
 
@@ -867,7 +878,7 @@ class GIN(nn.Module):
 
         if not global_feats is None:
             # print('global_feats', global_feats.shape)
-            x = cat((x, global_feats), dim=1).to(dtype=torch.float32)
+            x = cat((x, global_feats), dim=1).to(dtype=torch.float)
 
         # print('x', x.shape, x.dtype)
         # print(self.ffn.state_dict().keys())
@@ -884,4 +895,26 @@ class GIN(nn.Module):
             x = self.classification_out_layer(x)
 
         # print(f"H = {h}")
+        return x
+
+    def get_embedding(self, data):
+        x, edge_index, edge_attr, dbatch = (
+            data.x.float(),
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+        global_feats = data.global_feats if "global_feats" in data.to_dict() else None
+        x=x.float()
+        x = self.conv1(x, edge_index)
+
+        for gconvo in self.convs:
+            x = gconvo(x, edge_index)
+
+        x = self.global_pooling(x, dbatch)
+
+        if not global_feats is None:
+            # print('global_feats', global_feats.shape)
+            x = cat((x, global_feats), dim=1).to(dtype=torch.float32)
+
         return x

@@ -303,14 +303,17 @@ class GNNTrainer(object):
             # print("\n", f"train_true[:5] = {train_true[:5]}\n")
             loss = None
             # print("\n", f"output[:5] = {output[:5]}\n") #, f"torch.max = {torch.max(output[:5], 1)}
-            if self.task == "binary_classification":
-                # print("train_pred", output.squeeze(1))
+            if self.task in ["binary_classification", "multiclass_classification"]:
                 loss = self.compute_loss(self.criterion, output.squeeze(1), train_true)
+            # if self.task == "binary_classification":
+            #     # print("train_pred", output.squeeze(1))
+            #     loss = self.compute_loss(self.criterion, output.squeeze(1), train_true)
 
-            elif self.task == "multilabel_classification":
-                _, train_pred = torch.max(output, 1)
-                loss = self.compute_loss(self.criterion, _, train_true)
-                # print(f"train_pred = {train_pred.shape}", "\n", f"train_true = {train_true.view(-1,1).shape}")
+            # elif self.task == "multilabel_classification":
+            #     # _, train_pred = torch.max(output, 1)
+            #     # loss = self.compute_loss(self.criterion, _, train_true)
+            #     loss = self.compute_loss(self.criterion, output.squeeze(1), train_true)
+            #     # print(f"train_pred = {train_pred.shape}", "\n", f"train_true = {train_true.view(-1,1).shape}")
 
             elif self.task == "regression":
                 loss = self.compute_loss(self.criterion, output, train_true)
@@ -352,14 +355,18 @@ class GNNTrainer(object):
             loss = None
             score = None
 
-            if self.task in ["binary_classification", "multilabel_classification"]:
-                if self.task == "binary_classification":
-                    val_pred = val_pred.squeeze()
-                    # print("val_pred", val_pred[:10])
-                    loss = self.compute_loss(self.criterion, val_pred, val_true)
-                else:
-                    _, val_pred = torch.max(val_pred, 1)
-                    loss = self.compute_loss(self.criterion, _, val_true)
+            if self.task in ["binary_classification", "multiclass_classification"]:
+                val_pred = val_pred.squeeze()
+                # print("val_pred", val_pred[:10])
+                loss = self.compute_loss(self.criterion, val_pred, val_true)
+                # if self.task in "binary_classification":
+                #     val_pred = val_pred.squeeze()
+                #     # print("val_pred", val_pred[:10])
+                #     loss = self.compute_loss(self.criterion, val_pred, val_true)
+                # # else:
+                # #     # _, val_pred = torch.max(val_pred, 1)
+                # #     # loss = self.compute_loss(self.criterion, _, val_true)
+                    
 
                 # print(f"val_pred({val_pred.shape}) = {val_pred[:5]}", "\n", f"val_true({val_true.shape}) = {val_true[:5]}")
                 # print(f"Batch {batch_counter}: \n\t{val_pred.tolist()} \n\t{val_true.tolist()}")

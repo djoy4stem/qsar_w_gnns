@@ -1,16 +1,18 @@
 import os
 from os.path import join
 import sys
+import copy
 
 from typing import List, Union, Any, Set, Dict
 from datetime import datetime
 from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from tqdm import tqdm
 import torch
 import torch_geometric
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_networkx
 import networkx as nx
@@ -54,13 +56,15 @@ def graph_from_molecule(
 
     # try:
     if True:
-        if add_explicit_h:
-            molecule = Chem.AddHs(molecule)
+
         mol_features = None
         if compute_global_features:
             mol_features = mol_featurizer.compute_properties_for_mols(
-                [molecule], as_dataframe=False
+                [molecule], as_dataframe=False, add_explicit_h=True
             )
+
+        if not add_explicit_h:
+            molecule = Chem.RemoveHs(molecule)
 
         for atom in molecule.GetAtoms():
             atom_features.append(atom_featurizer.encode(atom))
@@ -117,6 +121,8 @@ def graphs_from_mol_list(
     add_explicit_h: bool = False,
     compute_global_features: bool = True,
     add_global_feat_to_nodes: bool = False,
+    scale_features: bool = False,
+    feature_scaler: bool = None 
 ):
     # Initialize graph
     atom_features = []
@@ -150,7 +156,7 @@ def graphs_from_mol_list(
                 bond_featurizer=bond_featurizer,
                 mol_featurizer=mol_featurizer,
                 compute_global_features=False,
-                add_global_feat_to_nodes=False,
+                add_global_feat_to_nodes=False
             )
         )  # .values.tolist()
         # len_ab_feats = atom_and_bond_features_df)
@@ -171,20 +177,32 @@ def graphs_from_mol_list(
                 for i in range(len_mol_features):
                     data = atom_and_bond_features_df.iloc[i]
                     mf = list(mol_features[i].values())
-                    if not add_global_feat_to_nodes:
-                        # print(mol_features[i].values())
-                        data.global_feats = torch.as_tensor(mf, dtype=torch.float)
-                    else:
-                        # print(data.x, data.x.shape)
-                        merged = torch.cat(
-                            (data.x, torch.as_tensor([mf] * data.x.shape[0])), dim=1
-                        )
-                        data.x = merged
-                        # print(data.x)
-                        # print(data.x.shape)
-
+                    data.global_feats = torch.as_tensor(mf, dtype=torch.float)
+                    # if not add_global_feat_to_nodes:
+                    #     # print(mol_features[i].values())
+                    #     data.global_feats = torch.as_tensor(mf, dtype=torch.float)
+                    # else:
+                    #     # print(data.x, data.x.shape)
+                    #     merged = torch.cat(
+                    #         (data.x, torch.as_tensor([mf] * data.x.shape[0])), dim=1
+                    #     )
+                    #     data.x = merged
+                    #     # print(data.x)
+                    #     # print(data.x.shape)
+                    # print(f"data = {data}")
                     graphs.append(data)
         # print("Graph from mol 1", f" x {graphs[0].x.shape} - edge_attr {graphs[0].edge_attr.shape}")
+
+
+        print("Clean features...")
+        graphs = clean_features_from_data_and_batch(data=graphs,
+                    scale_features = scale_features,
+                    feature_scaler=feature_scaler,
+                    add_global_feats_to_nodes=add_global_feat_to_nodes,
+                    return_as_list = True
+)
+
+
         return graphs
 
     # except Exception as exp:
@@ -200,6 +218,8 @@ def graph_from_smiles_list(
     mol_featurizer: feat.MoleculeFeaturizer = feat.MoleculeFeaturizer(),
     compute_global_features: bool = True,
     add_global_feat_to_nodes: bool = False,
+    scale_features: bool = False,
+    feature_scaler: bool = None 
 ):
     molecules = [
         utilities.molecule_from_smiles(smiles, add_explicit_h) for smiles in smiles_list
@@ -211,6 +231,8 @@ def graph_from_smiles_list(
         mol_featurizer=mol_featurizer,
         compute_global_features=compute_global_features,
         add_global_feat_to_nodes=add_global_feat_to_nodes,
+        scale_features=scale_features,
+        feature_scaler=feature_scaler
     )
 
     return graphs
@@ -225,6 +247,8 @@ def get_dataset_from_smiles_list(
     mol_featurizer: feat.MoleculeFeaturizer = feat.MoleculeFeaturizer(),
     compute_global_features: bool = True,
     add_global_feat_to_nodes: bool = False,
+    scale_features: bool = False,
+    feature_scaler: bool = None    
 ):
     graph_dataset = graph_from_smiles_list(
         smiles_list=smiles_list,
@@ -234,6 +258,8 @@ def get_dataset_from_smiles_list(
         mol_featurizer=mol_featurizer,
         compute_global_features=compute_global_features,
         add_global_feat_to_nodes=add_global_feat_to_nodes,
+        scale_features=scale_features,
+        feature_scaler=feature_scaler
     )
 
     ## Add targets
@@ -255,6 +281,8 @@ def get_dataset_from_dframe(
     mol_featurizer: feat.MoleculeFeaturizer = feat.MoleculeFeaturizer(),
     compute_global_features: bool = True,
     add_global_feat_to_nodes: bool = False,
+    scale_features: bool = False,
+    feature_scaler: bool = None
 ):
     # print("input_df.shape=", input_df.shape)
     # print(input_df
@@ -266,6 +294,8 @@ def get_dataset_from_dframe(
         mol_featurizer=mol_featurizer,
         compute_global_features=compute_global_features,
         add_global_feat_to_nodes=add_global_feat_to_nodes,
+        scale_features=scale_features,
+        feature_scaler=feature_scaler
     )
 
     # print("graph_dataset = ", graph_dataset)
@@ -291,6 +321,8 @@ def get_dataset_from_mol_list(
     mol_featurizer: feat.MoleculeFeaturizer = feat.MoleculeFeaturizer(),
     compute_global_features: bool = True,
     add_global_feat_to_nodes: bool = False,
+    scale_features: bool = False,
+    feature_scaler: bool = None
 ):
     graph_dataset = graphs_from_mol_list(
         molecules=mol_list,
@@ -300,6 +332,8 @@ def get_dataset_from_mol_list(
         add_explicit_h=add_explicit_h,
         compute_global_features=compute_global_features,
         add_global_feat_to_nodes=add_global_feat_to_nodes,
+        scale_features=scale_features,
+        feature_scaler=feature_scaler
     )
 
     ## Add targets
@@ -311,3 +345,106 @@ def get_dataset_from_mol_list(
         # print(f'{i}', graph_dataset[i].global_feats.shape, graph_dataset[i].global_feats)
 
     return graph_dataset
+
+
+
+def add_global_features_to_nodes(data: Union[Data, Batch]):
+    # def cat_1d_to_2d_tensor(tensor_1d, tensor_2d):
+    #     # expland tensor_1d (shape = d) using tensor_2d (shape = [n,m])
+    #     tensor_1d_expanded = tensor_1d.unsqueeze(0).expand(tensor_2d.size(0), -1)  # Shape: [n, d]
+    #     # Concatenate along the feature dimension (columns)
+    #     t_concat = torch.cat([tensor_2d, tensor_1d_expanded], dim=1)  # Shape: [n, m + d]
+    #     return t_concat
+    new_data = copy.deepcopy(data)
+    if isinstance(data, List):
+        for i in range(len(data)):
+            # print(data[i].global_feats)
+            new_data[i].x = utilities.concat_1d_to_2d_tensor(torch.tensor(new_data[i].global_feats), new_data[i].x)
+            new_data[i].global_feats = None
+        
+    elif isinstance(data, Batch):
+        new_data = new_data.to_data_list()
+        for i in range(len(data)):
+            # print(data[i].global_feats)
+            new_data[i].x = utilities.concat_1d_to_2d_tensor(tensor(new_data[i].global_feats), new_data[i].x)
+            new_data[i].global_feats = None
+
+        new_data = Batch.from_data_list(new_data)
+                
+
+    return new_data
+
+
+def clean_features_from_data_and_batch(data: Union[Batch, List[Data]],
+                        scale_features: bool = True,
+                        feature_scaler=MinMaxScaler(),
+                        add_global_feats_to_nodes: bool = False,
+                        return_as_list: bool = False
+):
+
+    has_global_feats = False
+    num_data_objects, dim_global_feats = None, None 
+    global_feats_reshaped = None
+    cleaned_data = data
+
+        
+
+    ## does that have globale features
+    if isinstance(data, List) and len(data)>0:
+        assert isinstance(data[0], Data), "Error: All elements must be of type Data."
+        # print(f"First class: {data[0].__class__}")
+        # for i in range(len(data)):
+            # # print(data[i])
+            # if hasattr(data[i], "global_feats") and data[i].global_feats is None:
+            #     print(f"{i} has None global_feats")
+            # if not hasattr(data[i], "global_feats"):
+            #     print(f"{i} has no global_feats")
+
+        all_have_global_feats = all([hasattr(d, "global_feats")  and not d.global_feats is None for d in data])
+        assert all_have_global_feats, "Error: Some Data objects of the list either have a non-existing or null attribute global_feats."
+
+        has_global_feats = all_have_global_feats
+
+        num_data_objects = len(data)
+        dim_global_feats = data[0].global_feats.shape[-1]
+
+        global_feats_reshaped = [d.global_feats for d in data]
+
+
+    elif isinstance(data, batch):
+        has_global_feats = (
+            hasattr(data, "global_feats") and not data.global_feats is None
+        )
+
+        # Reshape global_feats to a 2D tensor
+        num_data_objects = data.batch.max().item() + 1
+        dim_global_feats = int(data.global_feats.shape[0]/num_data_objects) ## This must be an integer
+        global_feats_reshaped = data.global_feats.view(num_data_objects, dim_global_feats)
+
+    if scale_features:
+        assert (not feature_scaler is None), f"ValueError: Provide a valid feature scaler. None provided."
+        # Clean/Scale
+        global_feats_reshaped = utilities.clean_features(
+            features=global_feats_reshaped, feature_scaler=feature_scaler
+        )
+        print("global_feats_reshaped", global_feats_reshaped.shape)
+        # print(global_feats_reshaped.__class__)
+
+        if isinstance(data, List):
+            cleaned_data = data
+            for i in range(len(data)):
+                cleaned_data[i].global_feats = global_feats_reshaped[i]
+
+        elif isinstance(data, batch):
+            # Flatten and assign back
+            print("tensor(global_feats_reshaped).view(-1)", tensor(global_feats_reshaped).view(-1))
+            cleaned_data.global_feats = tensor(global_feats_reshaped).view(-1)
+    
+    if add_global_feats_to_nodes:
+        if not has_global_feats:
+            warnings.warn("There are no global features to add. The data will be returned as is.")
+        else:
+            cleaned_data = add_global_features_to_nodes(cleaned_data)
+
+
+    return cleaned_data

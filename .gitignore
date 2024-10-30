@@ -1,5 +1,6 @@
 
 *.pt
+*.pkl
 *.pyc
 *.old
 data/*.pt
@@ -10,6 +11,7 @@ data/models/
 lib/__pycache__/**
 
 !data/figures/.gitkeep
+!data/figures/gcn.png
 !data/models/.gitkeep
 !data/models/checkpoints/.gitkeep
 

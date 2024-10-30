@@ -3,7 +3,7 @@ import sys
 import inspect
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
+
 from typing import List, Union, Any, Tuple
 from itertools import chain
 import random
@@ -12,11 +12,20 @@ from sklearn.manifold import TSNE
 
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdmolops
-from rdkit.Chem.AllChem import Mol
+from rdkit.Chem.AllChem import Mol, GetAtomPairFingerprint, GetMACCSKeysFingerprint, \
+                                     GetTopologicalTorsionFingerprint, GetMorganFingerprint
+
+                                    
 from rdkit.Chem.rdMolDescriptors import (
     GetMorganFingerprint,
     GetAtomPairFingerprint,
     GetTopologicalTorsionFingerprint,
+    GetMACCSKeysFingerprint,
+
+    GetMorganFingerprintAsBitVect, 
+    GetMACCSKeysFingerprint, 
+    GetHashedAtomPairFingerprint, 
+    GetHashedTopologicalTorsionFingerprintAsBitVect
 )
 from rdkit.Chem import (
     PandasTools,
@@ -28,18 +37,45 @@ from rdkit.Chem import (
 )
 from rdkit.SimDivFilters.rdSimDivPickers import MaxMinPicker
 
-from torch import manual_seed, cuda, backends, Generator
+from torch import manual_seed, cuda, backends, Generator, use_deterministic_algorithms, tensor, cat
 
-import networkx as nx
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.impute import SimpleImputer
+
+
+def concat_1d_to_2d_tensor(tensor_1d, tensor_2d):
+    # expland tensor_1d (shape = d) using tensor_2d (shape = [n,m])
+    tensor_1d_expanded = tensor_1d.unsqueeze(0).expand(tensor_2d.size(0), -1)  # Shape: [n, d]
+    # Concatenate along the feature dimension (columns)
+    t_concat = cat([tensor_2d, tensor_1d_expanded], dim=1)  # Shape: [n, m + d]
+    return t_concat
+
+def clean_features(features: List[List], feature_scaler=MinMaxScaler()):
+    imputer = SimpleImputer(missing_values=np.nan, strategy="mean")
+    stdzr = feature_scaler
+
+    cleaned = imputer.fit_transform(features)
+    # print("imputed\n", imputed)
+    if not feature_scaler is None:
+        cleaned = stdzr.fit_transform(cleaned)
+
+    return cleaned
+
 
 def check_if_param_used(cls, param_name):
     signature = inspect.signature(cls.__init__)
     return param_name in signature.parameters
 
-def set_seeds(seed: int = None):
+def set_seeds(seed: int = None, torch_use_deterministic_algos:bool = True):
     os.environ["PYTHONHASHSEED"] = str(
         seed
     )  # controls the hash seed for hash-based operations so they are reproducible, if seed is not None
+
+    ## ensure deterministic behavior when using CUDA's cuBLAS library, especially for GPU 
+    # operations that involve matrix multiplications, convolutions, or other linear algebra computations.
+    # This sets the size of the cuBLAS workspace to 4096 bytes, and maximum number of temporary 
+    # workspaces that cuBLAS can use to 8.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # 
 
     random.seed(seed)
     np.random.seed(seed)
@@ -62,7 +98,7 @@ def set_seeds(seed: int = None):
             )
         backends.cudnn.benchmark = False  # causes cuDNN to benchmark multiple convolution algorithms and select the fastest
 
-    # torch.use_deterministic_algorithms(True)
+    use_deterministic_algorithms(torch_use_deterministic_algos)
 
 
 def randomize_smiles(smiles, isomericSmiles=False):
@@ -215,6 +251,72 @@ def min_max_train_test_split_df(
     return dataframe_train, dataframe_test
 
 
+def calculate_fingerprints_as_bits(molecules, fingerprint_type="morgan", radius=2, nBits=1024):
+
+    valid_fingerprints = ["morgan", "avalon", "atom-pair", "maccs", "top_torso"]
+
+    if fingerprint_type not in valid_fingerprints:
+        raise ValueError(
+            f"Invalid fingerprint type. Choose from {', '.join(valid_fingerprints)}."
+        )
+
+    # Create fingerprint generator based on type
+    if fingerprint_type == "morgan":
+
+        def fp_generator(mol):  # Pass the molecule as an argument
+            return GetMorganFingerprintAsBitVect(
+                mol, radius=radius, nBits=nBits
+            )
+
+    elif fingerprint_type == "avalon":
+
+        def fp_generator(mol):
+            return Chem.GetAvalonFP(mol, nBits=nBits)
+
+    elif fingerprint_type == "atom-pair":
+
+        def fp_generator(mol):
+            return GetHashedAtomPairFingerprintAsBitVect(mol)
+
+    elif fingerprint_type == "maccs":
+
+        def fp_generator(mol):
+            return GetMACCSKeysFingerprint(mol)
+
+    elif fingerprint_type == "top_torso":
+
+        def fp_generator(mol):
+            return GetHashedTopologicalTorsionFingerprintAsBitVect(mol)        
+
+    else:
+        raise ValueError(
+            f"Internal error: Unknown fingerprint type {fingerprint_type}."
+        )
+
+    # Generate fingerprints
+    fingerprints = [fp_generator(mol).ToList() for mol in molecules]
+
+    return fingerprints
+
+
+def get_fingerprints(list_of_rdkit_molecules,fp_type="morgan"):
+    """
+    fp_types = { "morgan": "GetMorganFingerprint", "atom_pair": "GetAtomPairFingerprint", "top_torso": "GetTopologicalTorsionFingerprint"}
+    """   
+
+    fps = None
+    assert fp_type in ["morgan", "atom_pair", "top_torso"], "ValueError: The supported fingerprint types are morgan, atom_pair, and top_torso (for topological_torsiopnal)"
+    if fp_type == "morgan":
+        fps = [GetMorganFingerprint(x, 3) for x in list_of_rdkit_molecules]
+    elif fp_type == "atom_pair":
+        fps = [GetAtomPairFingerprint(x) for x in list_of_rdkit_molecules]
+    elif fp_type == "top_torso":
+        fps = [GetTopologicalTorsionFingerprint(x) for x in list_of_rdkit_molecules]
+
+    return fps
+
+
+
 def min_max_train_test_split(
     list_of_rdkit_molecules,
     test_ratio,
@@ -229,12 +331,8 @@ def min_max_train_test_split(
     picker = MaxMinPicker()
     fps = None
 
-    if fp_type == "morgan":
-        fps = [GetMorganFingerprint(x, 3) for x in list_of_rdkit_molecules]
-    elif fp_type == "atom_pair":
-        fps = [GetAtomPairFingerprint(x) for x in list_of_rdkit_molecules]
-    elif fp_type == "top_torso":
-        fps = [GetTopologicalTorsionFingerprint(x) for x in list_of_rdkit_molecules]
+    fps = get_fingerprints(list_of_rdkit_molecules=list_of_rdkit_molecules
+                            , fp_type=fp_type)
 
     nfps = len(fps)
     n_training_compounds = round(nfps * (1 - test_ratio))
@@ -258,11 +356,11 @@ def min_max_train_test_split(
         ]
 
 
-def mol2fp(mol):
-    fp = AllChem.GetHashedMorganFingerprint(mol, 2, nBits=4096)
-    ar = np.zeros((1,), dtype=np.int8)
-    DataStructs.ConvertToNumpyArray(fp, ar)
-    return ar
+# def mol2fp(mol):
+#     fp = AllChem.GetHashedMorganFingerprint(mol, 2, nBits=4096)
+#     ar = np.zeros((1,), dtype=np.int8)
+#     DataStructs.ConvertToNumpyArray(fp, ar)
+#     return ar
 
 
 def flatten_list(mylist: List[Any]):
@@ -511,112 +609,3 @@ def min_max_train_validate_test_split(
         return None
 
 
-#######################################
-#             VISUALIZATION           #
-#######################################
-def plots_train_val_metrics(
-    train_losses: List[float],
-    val_scores: List[float],
-    val_losses: List[float] = None,
-    figsize: Tuple = (10, 7),
-    image_pathname: str = None,
-    val_score_name: str = None,
-):
-    plt.figure(figsize=figsize)
-    plt.plot(train_losses, color="orange", label="train loss")
-    if not val_losses is None:
-        plt.plot(val_losses, color="red", label="val. loss")
-    val_score_label = (
-        "val. score" if val_score_name is None else f"val. score ({val_score_name})"
-    )
-
-    plt.plot(val_scores, color="green", label=val_score_label)
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss/Score")
-    plt.legend()
-    if not image_pathname is None:
-        plt.savefig(image_pathname)
-    plt.show()
-
-
-def plot_embeddings(model, data):
-    """
-    From https://mlabonne.github.io/blog/posts/2022-03-09-Graph_Attention_Network.html#iii.-implementing-a-graph-attention-network
-    """
-
-    h = model(data)
-
-    # Train TSNE
-    tsne = TSNE(n_components=2, learning_rate="auto", init="pca").fit_transform(
-        h.detach()
-    )
-
-    # Plot TSNE
-    plt.figure(figsize=(10, 10))
-    plt.axis("off")
-    plt.scatter(tsne[:, 0], tsne[:, 1], s=50, c=data.y)
-    plt.show()
-
-
-def visualize_colored_graph(edge_index, edge_mask, data, threshold=0.5):
-    # Build graph from edge_index
-    G = nx.Graph()
-    edge_list = edge_index.t().tolist()  # Convert edge_index to list of edges
-
-    # Remove self-loops (edges where source and target nodes are the same)
-    edge_list = [edge for edge in edge_list if edge[0] != edge[1]]
-
-    G.add_edges_from(edge_list)
-
-    # Convert edge_mask to numpy and resize if necessary
-    edge_mask = edge_mask.cpu().detach().numpy()  # Convert tensor to numpy
-    if len(edge_mask) != len(edge_list):
-        edge_mask = edge_mask[: len(edge_list)]
-
-    important_edges = edge_mask > threshold
-
-    # Normalize the edge_mask for coloring
-    edge_mask_normalized = edge_mask / edge_mask.max()  # Normalize to [0, 1]
-
-    # Create the list of edge colors using colormap
-    cmap = plt.cm.Reds  # Colormap to use
-    edge_colors = cmap(edge_mask_normalized)  # Get colors for edges
-
-    # Filter the edges based on importance (threshold)
-    edges_to_draw = np.array(edge_list)[important_edges]
-    edge_colors_to_draw = edge_colors[important_edges]
-
-    # Get node positions
-    pos = nx.spring_layout(G)  # Position the graph layout
-    plt.figure(figsize=(8, 6))  # Set figure size
-
-    # Draw nodes
-    nx.draw_networkx_nodes(G, pos, node_color="lightblue", node_size=500)
-
-    # Draw edges with corresponding colors
-    nx.draw_networkx_edges(
-        G,
-        pos,
-        edgelist=edges_to_draw,
-        edge_color=edge_colors_to_draw,
-        edge_cmap=cmap,
-        width=2,
-        edge_vmin=0,
-        edge_vmax=1,
-    )
-
-    # Add labels
-    nx.draw_networkx_labels(G, pos, font_size=10, font_color="black")
-
-    # Add colorbar for edge colors
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
-    sm.set_array([])  # Set the array to use for color mapping
-
-    # Create a new Axes for colorbar
-    ax_colorbar = plt.axes(
-        [0.95, 0.12, 0.03, 0.75]
-    )  # Adjust the position and size of the colorbar
-    plt.colorbar(sm, cax=ax_colorbar)  # Create the colorbar
-
-    plt.title("Graph with Edge Importance")
-    plt.show()
