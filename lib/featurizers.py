@@ -6,31 +6,86 @@ from rdkit.Chem import (
     Draw,
     AllChem,
     Crippen,
+    Lipinski,
     QED,
     Descriptors,
     GraphDescriptors,
     Fragments,
     MolToSmiles,
     GetPeriodicTable,
+    MACCSkeys,
 )
 from rdkit.Chem import rdMolDescriptors as rdmdesc
-from typing import List, Any
+from rdkit.Chem import rdPartialCharges as rdpart
+from typing import List, Any, Union
 from lib import utilities
 import re
 import mordred
 from mordred import descriptors, Calculator
 from time import time
+import warnings
+import ast
 
 RDLogger.DisableLog("rdApp.*")
 
 
 RDKIT_FRAGS = [
-    [frag_name, MolToSmiles(eval(f"Fragments.{frag_name}").__defaults__[1])]
+    [frag_name, Chem.MolToSmarts(eval(f"Fragments.{frag_name}").__defaults__[1])]
     for frag_name in dir(Fragments)
     if not re.match("^fr", frag_name) is None
 ]
-DF_FUNC_GRPS = pd.DataFrame(RDKIT_FRAGS, columns=["name", "SMARTS"])
 
+
+def get_maccs_smarts():
+    patts = MACCSkeys.smartsPatts
+    # return [[f"maccs_{k}",patts[k][0]]  for k in patts if not patts[k][0] == '?'][:] # Remove the first pattern ('?') because of parsing issues.
+    return [
+        [f"maccs_{k}", patts[k][0]] for k in patts if not k in [1, 125, 166]
+    ]  # Remove the first pattern ('?') because of parsing issues.
+
+
+def get_maccs_substructures():
+    """
+    Returns a list of (bit, substructure) tuples for MACCS keys.
+    Each bit corresponds to a substructure pattern.
+    """
+    # maccs_bits = MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles("CC"))
+    maccs_bits = get_maccs_smarts()
+    substructures = []
+
+    # Map each MACCS bit to a substructure. Note that some bits do not directly
+    # correspond to specific substructures and may return None.
+    # for bit in range(1, maccs_bits.GetNumBits()):
+    for item in range(len(maccs_bits)):
+        # print("bit", bit)
+        # print(bit, MACCSkeys.smartsPatts[bit])
+        bit = maccs_bits[item][0]
+        substructure = maccs_bits[item][1]
+        if substructure:
+            # print(substructure)
+            substructures.append(
+                (bit, Chem.MolFromSmarts(substructure), (bit, item))
+            )  # The last will be helpful, as some maccs keys were removed.
+        else:
+            substructures.append((bit, None, (bit, item)))
+    # print(len(substructures))
+    return substructures
+
+
+def get_substructures(func_groups: Union[List, str]):
+    substructures = list(
+        map(lambda item: [item[0], Chem.MolFromSmarts(item[1])], func_groups)
+    )
+    if func_groups == "maccs":
+        return get_maccs_substructures()
+    else:
+        for i in range(len(substructures)):
+            substructures[i].append([substructures[i][0], i])
+        return substructures
+
+
+MACCS_FP = pd.DataFrame(get_maccs_smarts(), columns=["name", "SMARTS"])
+DF_FUNC_GRPS_RDKIT = pd.DataFrame(RDKIT_FRAGS, columns=["name", "SMARTS"])
 
 ## Some examples were taken from https://www.daylight.com/dayhtml_tutorials/languages/smarts/smarts_examples.html
 DF_FUNC_GRPS_MINI = pd.DataFrame(
@@ -53,16 +108,46 @@ DF_FUNC_GRPS_MINI = pd.DataFrame(
             "thioether",
             "[SX2]([#6;!$(C([SX2])[O,S,#7,#15,F,Cl,Br,I])])[#6;!$(C([SX2])[O,S,#7,#15])]",
         ],
+        [
+            "dialkylether",
+            "[#6;A;X4;!$(C([OX2])[O,S,#7,#15,F,Cl,Br,I])][#8;X2][#6;A;X4;!$(C([OX2])[O,S,#7,#15])]",
+        ],
+        [
+            "diarylether",
+            "[$([cX3](:[!#1;*]):[!#1;*]),$([cX2+](:[!#1;*]):[!#1;*])]-[#8]-[$([cX3](:[!#1;*]):[!#1;*]),$([cX2+](:[!#1;*]):[!#1;*])]",
+        ],
+        [
+            "dialkylthioether",
+            "[#6;A;X4;!$(C([OX2])[O,S,#7,#15,F,Cl,Br,I])][#16;X2][#6;A;X4;!$(C([OX2])[O,S,#7,#15])]",
+        ],
+        ["diarylthioether", "[#6;a]-[#16;X2]-[#6;a]"],
         ["lactone", "[#6][#6X3R](=[OX1])[#8X2][#6;!$(C=[O,N,S])]"],
         [
             "lactam",
             "	[#6R][#6X3R](=[OX1])[#7X3;$([H1][#6;!$(C=[O,N,S])]),$([H0]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])])]",
         ],
         ["alcohol", "[OX2H][CX4;!$(C([OX2H])[O,S,#7,#15])]"],
-        ["phenol", "[OX2H][c]"],
+        ["arom_alcohol", "[OX2H][c]"],
+        ["arom_ether", "[OX2]([C,c])[c]"],
         ["amine", "[NX3+0,NX4+;!$([N]~[!#6]);!$([N]*~[#7,#8,#15,#16])]"],
+        ["dialkylarylamine", "[#6;A;X4][#7;v3X3](-[#6;a])[#6;A;X4]"],
+        ["alkyldiarylamine", "[#6;A;X4][#7;v3X3;!R](-[#6;a])-[#6;a]"],
         ["arylhalide", "[Cl,F,I,Br][c]"],
         ["alkylhalide", "[Cl,F,I,Br][CX4]"],
+        ["acylhalide", "[CX3;$([R0][#6]),$([H1R0])](=[OX1])[Cl,F,I,Br]"],
+        [
+            "aldimine",
+            "[H][#6](-[#6])!@=[#7;A;X2;$([N][#6]),$(n);!$([N][CX3]=[#7,#8,#15,#16])]",
+        ],
+        ["aldoxime", "[H][#8]!@\[#7]!@=[#6](/[H])-[#6]"],
+        ["aldamine", "[H]\[#6](-[#6])!@=[#7]!@\[#7]!@=[#6](/[H])-[#6]"],
+        ["pyran", "[$(C1OC=CC=C1),$(C1CC=CCO1),$(C1C=COC=C1)]"],
+        ["pyrazole", "c1cnnc1"],
+        ["pyridine", "c1ccncc1"],
+        ["pyrimidine", "c1cncnc1"],
+        ["purine", "c1nc2cncnc2n1"],
+        ["n_arylamide", "[H][#7;X3R0](-[#6;a])-[#6;X3R0]([#6,#1;A])=[O;X1]"],
+        ["n_acyl_piperidine", "[#6]!@-[#6](=O)!@-[#7]-1-[#6]-[#6]-[#6]-[#6]-[#6]-1"],
         ["urea", "[#7X3;!$([#7][!#6])][#6X3](=[OX1])[#7X3;!$([#7][!#6])]"],
         ["thiourea", "[#7X3;!$([#7][!#6])][#6X3](=[SX1])[#7X3;!$([#7][!#6])]"],
         [
@@ -77,22 +162,212 @@ DF_FUNC_GRPS_MINI = pd.DataFrame(
         ["nitro_group", "[$([NX3](=O)=O),$([NX3+](=O)[O-])][!#8]"],
         ["carbo_thiocarboxylate", "[S-][CX3](=S)[#6]"],
         ["sulfone", "[$([#16X4](=[OX1])=[OX1]),$([#16X4+2]([OX1-])[OX1-])]"],
+        ["2,4-disubstituted-1,3-oxazole", "[H]c1oc(!@-[!#1;*])nc1!@-[!#1;*]"],
+        ["3-aroylfuran", "[!#1;A;a]-[#6](=O)!@-c1ccoc1"],
+        ["3-aroylthiophene", "[!#1;A;a]-[#6](=O)!@-c1ccsc1"],
+        ["cepham", "O=C1CC2SCCCN12"],
+        ["chloroalkene", "[Cl;X1][#6;A;X3]=[#6;A;X3]"],
+        ["clavam", "O=C1CC2OCCN12"],
+        ["cyanate", "OC#N"],
+        ["cyanate_ester", "COC#N"],
         [
-            "sulfonamide",
-            "[$([SX4](=[OX1])(=[OX1])([!O])[NX3]),$([SX4+2]([OX1-])([OX1-])([!O])[NX3])]",
+            "cyclic_ketone",
+            "[$([#6;R1]-[#6;R1](-[#6;R1])=[O;v2]),$([#6;R1][#6;R1]([#6;R1])=[O;v2])]",
         ],
+        ["delta_lactam", "O=C1CCCCN1"],
+        ["disulfide", "[#6]-[#16;X2]!@-[#16;X2]-[#6]"],
+        ["morpholine", "C1COCCN1"],
+        ["n_acetylarylamine", "[H][#7;X3R0](-[#6;a])-[#6;R0](-[#6;H3X4])=O"],
+        ["n_acyl-piperidine", "[#6]!@-[#6](=O)!@-[#7]-1-[#6]-[#6]-[#6]-[#6]-[#6]-1"],
+        ["n_acylimidazole", "[#6,#1]-[#6](=[O;X1])-n1ccnc1"],
+        ["n_substituted_pyrrole", "[!#1;*]!@-n1cccc1"],
+        ["nitroaromatic_compound", "[$([#6;a]-[#7+](-[#8-])=O),$([#6;a]N(=O)=O)]"],
+        ["nitrosourea", "[#7]!@-[#6](!@=O)!@-[#7]!@-[#7]!@=O"],
+        ["oxane", "C1CCOCC1"],
+        ["oxaziridine", "C1NO1"],
+        ["penam", "O=C1CC2SCCN12"],
+        ["penem", "O=C1CC2SC=CN12"],
+        ["pubchem_561", "O=S-C-C"],
+        ["pubchem_577", "O-S-C:C"],
+        ["pubchem_610", "O-N-C-C"],
+        ["pubchem_817", "Cc1ccc(C)cc1"],
+        ["pubchem_720", "Oc1ccc(S)cc1"],
+        ["pubchem_879", "Brc1c(Br)cccc1"],
+        ["pubchem_970", "SC1C(Br)CCC1"],
         ["sp3_nitrogen", "[$([NX4+]),$([NX3]);!$(*=*)&!$(*:*)]"],
         ["unbranched_alkane", "[R0;D2][R0;D2][R0;D2][R0;D2]"],
         ["unbranched_chain", "[R0;D2]~[R0;D2]~[R0;D2]~[R0;D2]"],
-        ["para_subs_ring", "*-!:aaaa-!:*"],
-        ["meta_subs_ring", "*-!:aaa-!:*"],
-        ["ortho_subs_ring", "*-!:aa-!:*"],
+        # ["para_subs_ring", "*-!:aaaa-!:*"],
+        # ["meta_subs_ring", "*-!:aaa-!:*"],
+        # ["ortho_subs_ring", "*-!:aa-!:*"],
         ["azide_ion", "[$([NX1-]=[NX2+]=[NX1-]),$([NX1]#[NX2+]-[NX1-2])]"],
         ["N#S", "N#S"],
         ["N=S", "N=S"],
         ["S=S", "S=S"],
         ["C#S", "C#S"],
-        ["michael_acceptor", "[CX3]=[CX3][$([CX3]=[O,N,S]),$(C#[N]),$([S,P]=[OX1]),$([NX3]=O),$([NX3+](=O)[O-])]"]
+        ["trihalomethyl", "[$([#6;X4]([F,Cl,Br,I])([F,Cl,Br,I])[F,Cl,Br,I])]"],
+        ["organohalogen", "[#6;+0]!@-[F,Cl,Br,I]"],
+        ["n_substituted_imidazole", "[!#1;*]n1ccnc1"],
+        ["n_arylpiperazine", "[#6;a]!@-[#7]-1-[#6]-[#6]-[#7]-[#6]-[#6]-1"],
+        ["n_alkylpiperazine", "[#6;A;X4][#7]-1-[#6]-[#6]-[#7]-[#6]-[#6]-1"],
+        [
+            "michael_acceptor",
+            "[CX3]=[CX3][$([CX3]=[O,N,S]),$(C#[N]),$([S,P]=[OX1]),$([NX3]=O),$([NX3+](=O)[O-])]",
+        ],
+        ["acylsulfonic_acid_deriv", "[!#1!#6][S;v6](=O)(=O)[#6;R0]=O"],
+        ["alkanesulfonic_acid_deriv", "[#6;A;X4]S([#8;X2])([#8;X2])=O"],
+        ["alkoxide", "[#6;A;X4][#8;D1R0-]"],
+        [
+            "alkyl_arylether",
+            "[#6;a]-[#8;X2][#6;A;X4;!$(C([OX2])[O,S,#7,#15,F,Cl,Br,I])]",
+        ],
+        [
+            "alkyl_arylthioether",
+            "[#6;a]-[#16;X2][#6;A;X4;!$(C([OX2])[O,S,#7,#15,F,Cl,Br,I])]",
+        ],
+        [
+            "alkylthiol",
+            "[#1,C,$([cX3](:[!#1;*]):[!#1;*]),$([cX2+](:[!#1;*]):[!#1;*])]-,=[#6]-[#16][H]",
+        ],
+        ["allyl_alcohol", "[H]!@-[#8]!@-[#6]!@-[#6]!@=[#6]"],
+        ["alpha,beta_enoate_ester", "[#6;!$(C=[O,N,S])][#8;A;D2][#6](=O)-[#6]=[#6;X3]"],
+        ["alpha_diketone", "[#6]!@-[#6](!@=O)!@-[#6](!@-[#6])!@=O"],
+        ["alpha_haloketone", "[#6]-[#6;X3](=[O;X1])-[#6]-[F,Cl,Br,I]"],
+        [
+            "alpha_hydroxyacid",
+            "[H][#8;v2]-[#6](-[*;#1,C,$([cX3](:[!#1;*]):[!#1;*]),$([cX2+](:[!#1;*]):[!#1;*])])-[#6](=O)-[#8][H]",
+        ],
+        ["alpha_ketoaldehyde", "[H][#6;R0](=[O;R0])-[#6;R0](-[#6])=[O;R0]"],
+        [
+            "carboxamide",
+            "[#7;A;X3;$([H2]),$([H1][#6;!$(C=[O,N,S])]),$([#7]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])])][#6](-[#6,#1])=[O;X1]",
+        ],
+        ["carboximidamide", "[#6,#1;A][#7]=[#6]-[#7]([#6,#1;A])[#6,#1;A]"],
+        ["carboxylic_thioester", "[#6]-[#16;X2]-[#6;X3](-[#6])=O"],
+        [
+            "carboxylic_acid_imide",
+            "[#6,#1]-[#7;X3](-[#6;X3](-[#6,#1])=[O;X1])-[#6;X3](-[#6,#1])=[O;X1]",
+        ],
+        [
+            "carboxylic_acid_imide_n_unsub",
+            "[H][#7;X3](-[#6;X3](-[#6,#1])=[O;X1])-[#6;X3](-[#6,#1])=[O;X1]",
+        ],
+        [
+            "carboxylic_acid_imide_n_sub",
+            "[#6]-[#7;X3](-[#6;X3](-[#6,#1])=[O;X1])-[#6;X3](-[#6,#1])=[O;X1]",
+        ],
+        ["imidazole", "c1cncn1"],
+        ["imine", "[#6,#1;A][#7;A;X2;!$(N~C~[!#1#6])]=[#6;A;X3,A]"],
+        ["indole", "c1cc2ccccc2n1"],
+        [
+            "phenylketone",
+            "[#6;X4]-[#6;X3](=O)!@-[c;R1]1[c;R1][c;R1][c;R1][c;R1][c;R1]1",
+        ],
+        ["acryloyl", "[#6;!R]-[#6](=O)-[#6;!R]=[#6;!R]"],
+        [
+            "alpha,beta_unsat_carbonyl",
+            "[$([*;#1,N,O,S,X,C]-[#6;R0](=O)[C;R0]!@#C),$([*;#1,N,O,S,X,C]-[#6;R0](=O)-[#6;R0]!@=[#6;X3])]",
+        ],
+        ["alpha,beta-unsat_ketone", "[#6]-[#6](=O)-[#6;R0]=[#6;R0]"],
+        ["alpha_hydroxyketone", "[H][#8;!R]-[#6;!R]-[#6](-[#6;!R])=O"],
+        ["alpha_keto-acid", "[#6]!@-[#6](=O)!@-[#6](!@-[#8])=O"],
+        ["alpha_hydroxy_ketone", "[OX2H1]CC(C)=O"],
+        ["amidoxime", "[#8;X2H1]\[#7]=[#6](\[#6])-[#7]([#6,#1;A])[#6,#1;A]"],
+        [
+            "aminal",
+            "[*;CX4,#1]-[#7](-[*;CX4,#1])C([*;CX4,#1])([*;CX4,#1])[#7](-[*;CX4,#1])-[*;CX4,#1]",
+        ],
+        ["isopropyl", "[#6;A;H3X4][#6;H1X4]([#6;A;H3X4])-[#7;X3]"],
+        [
+            "enolether",
+            "[#6;!$(C=[N,O,S])]-[#8;X2][#6;A;X3;$([H0][#6]),$([H1])]=[#6;A;X3]",
+        ],
+        [
+            "enolester",
+            "[#6;X3;!$(C[OX2H])]=[#6;X3;$([#6][#6]),$([H1])]-[#8;X2][#6;A;X3]=[O;X1]",
+        ],
+        ["enolester_epoxide", "[#6]-[#6]-1-[#8]-[#6]-1-[#8]-[#6]([#6,#1;A])=O"],
+        ["enolate", "[#8;v1-]!@\[#6]([#6,#1;A])!@=[#6](\[#6,#1;A])[#6,#1;A]"],
+        ["enone", "[#6;!R]-[#6](=[O;!R])-[#6;!R]=[#6;!R]"],
+        ["organoboron", "[#6][BX3]"],
+        [
+            "organo_sulfenic_acid_deriv",
+            "[$([#6]-[#16;v2X2][!#1!#6;N,O,X]),$([H][S;H1X4]([#6])=[O;X1])]",
+        ],
+        ["organosulfimide", "[#6;+0]-[#7]=S(=O)=O"],
+        [
+            "organosulfonic_acid_deriv",
+            "[#6;!$(C=[O,N,S])]-[#8][S;v6]([#6;!$(C=[O,N,S])])(=[O;X1])=[O;X1]",
+        ],
+        [
+            "sulicnic_acid_deriv",
+            "[C,$([cX3](:[!#1;*]):[!#1;*]),$([cX2+](:[!#1;*]):[!#1;*])][S;v4X3]([!#1!#6;O,N,X])=O",
+        ],
+        ["sulfinyl_halide", "[#6][S;v4X3]([F,Cl,Br,I])=O"],
+        [
+            "sulfuric_acid_diamide",
+            "[#7;A;X3;$([H2]),$([H1][#6;!$(C=[O,N,S])]),$([#7]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])])][S;X4]([#7;A;X3;$([H2]),$([H1][#6;!$(C=[O,N,S])]),$([#7]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])])])(=[O;X1])=[O;X1]",
+        ],
+        [
+            "sulfuric_acid_monoester",
+            "[#6]-[#8;X2][S;X4]([#8;A;X2H1,X1-])(=[O;X1])=[O;X1]",
+        ],
+        ["sulfuric_acid_diester", "[#6]-[#8;X2][S;X4](=[O;X1])(=[O;X1])[#8;X2]-[#6]"],
+        ["on_c_c", "[#8]~[#7](~[#6])~[#6]"],
+        ## https://github.com/openbabel/openbabel/blob/master/data/SMARTS_InteLigand.txt ##
+        ["epoxide", "[OX2r3]1[#6r3][#6r3]1"],
+        ["spiro", "[D4R;$(*(@*)(@*)(@*)@*)]"],
+        [
+            "n_hetero_imide",
+            "[#6X3;$([H0][#6]),$([H1])](=[OX1])[#7X3H0]([!#6])[#6X3;$([H0][#6]),$([H1])](=[OX1])",
+        ],
+        [
+            "alkyl_imide",
+            "[#6X3;$([H0][#6]),$([H1])](=[OX1])[#7X3H0]([#6])[#6X3;$([H0][#6]),$([H1])](=[OX1])",
+        ],
+        [
+            "thioamide",
+            "[$([CX3;!R][#6]),$([CX3H;!R])](=[SX1])[#7X3;$([H2]),$([H1][#6;!$(C=[O,N,S])]),$([#7]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])])]",
+        ],
+        ["prim_amide", "[CX3;$([R0][#6]),$([H1R0])](=[OX1])[NX3H2]"],
+        ["sec_amide", "[CX3;$([R0][#6]),$([H1R0])](=[OX1])[#7X3H1][#6;!$(C=[O,N,S])]"],
+        [
+            "ter_amide",
+            " [CX3;$([R0][#6]),$([H1R0])](=[OX1])[#7X3H0]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])]",
+        ],
+        [
+            "carbothioic_s_ester",
+            "[CX3;$([R0][#6]),$([H1R0])](=[OX1])[SX2][#6;!$(C=[O,N,S])]",
+        ],
+        ["carbothioic_s_lactone", "[#6][#6X3R](=[OX1])[#16X2][#6;!$(C=[O,N,S])]"],
+        [
+            "carbothioic_o_ester",
+            "[CX3;$([H0][#6]),$([H1])](=[SX1])[OX2][#6;!$(C=[O,N,S])]",
+        ],
+        ["carbothioic_o_lactone", "[#6][#6X3R](=[SX1])[#8X2][#6;!$(C=[O,N,S])]"],
+        ["carbothioic_halide", "[CX3;$([H0][#6]),$([H1])](=[SX1])[FX1,ClX1,BrX1,IX1]"],
+        ["carbodithioic_acid", "[CX3;!R;$([C][#6]),$([CH]);$([C](=[SX1])[SX2H])]"],
+        [
+            "carbodithioic_ester",
+            "[CX3;!R;$([C][#6]),$([CH]);$([C](=[SX1])[SX2][#6;!$(C=[O,N,S])])]",
+        ],
+        ["carbodithiolactone", "[#6][#6X3R](=[SX1])[#16X2][#6;!$(C=[O,N,S])]"],
+        [
+            "amide",
+            "[CX3;$([R0][#6]),$([H1R0])](=[OX1])[#7X3;$([H2]),$([H1][#6;!$(C=[O,N,S])]),$([#7]([#6;!$(C=[O,N,S])])[#6;!$(C=[O,N,S])])]",
+        ],
+        [
+            "_1,5_tautomerizable",
+            "[$([#7X2,OX1,SX1]=,:**=,:*[!H0;!$([a;!n])]),$([#7X3,OX2,SX2;!H0]*=**=*),$([#7X3,OX2,SX2;!H0]*=,:**:n)]",
+        ],
+        [
+            "ch_acidic",
+            "[$([CX4;!$([H0]);!$(C[!#6;!$([P,S]=O);!$(N(~O)~O)])][$([CX3]=[O,N,S]),$(C#[N]),$([S,P]=[OX1]),$([NX3]=O),$([NX3+](=O)[O-]);!$(*[S,O,N;H1,H2]);!$([*+0][S,O;X1-])]),$([CX4;!$([H0])]1[CX3]=[CX3][CX3]=[CX3]1)]",
+        ],
+        [
+            "ch_acidic_strong",
+            "[CX4;!$([H0]);!$(C[!#6;!$([P,S]=O);!$(N(~O)~O)])]([$([CX3]=[O,N,S]),$(C#[N]),$([S,P]=[OX1]),$([NX3]=O),$([NX3+](=O)[O-]);!$(*[S,O,N;H1,H2]);!$([*+0][S,O;X1-])])[$([CX3]=[O,N,S]),$(C#[N]),$([S,P]=[OX1]),$([NX3]=O),$([NX3+](=O)[O-]);!$(*[S,O,N;H1,H2]);!$([*+0][S,O;X1-])]",
+        ],
     ],
     columns=["name", "SMARTS"],
 )
@@ -105,15 +380,6 @@ class Featurizer:
         self.dim = 0
         self.features_mapping = {}
         for k, s in allowable_sets_one_hot.items():
-            # print(k, s)
-            # print(f"sorted(list(s)) = {sorted(list(s))}")
-            # if sorted(list(s)) == [False, True]:
-            #     s = sorted(list(s))
-            #     self.dim += len(s)
-            #     # print("s=", s)
-            #     self.features_mapping[k] = dict(zip(s, range(self.dim, len(s) + self.dim))) ## The + 1 marks a bit that will be populated with -1 is the value is not allowed
-            # else:
-            # print(f"{k}: list(s)", list(s))
             s = sorted(list(s)) + ["unk"]
             # print("s=", s)
             self.features_mapping[k] = dict(
@@ -128,7 +394,6 @@ class Featurizer:
                 self.features_mapping[p] = self.dim
                 self.dim += 1
                 # print(self.features_mapping[p])
-
         # print("==>", self.features_mapping)
 
     def encode(self, inputs):
@@ -152,10 +417,47 @@ class Featurizer:
                 )
         return output
 
+    def featurizer_to_values(self) -> pd.Series:
+        pos, values, f_types = [], [], []
+        for prop in self.features_mapping.items():
+            # print("prop", prop)
+
+            if isinstance(prop[1], int):
+                values.append(None)
+                pos.append(prop[1])
+                f_types.append(prop[0])
+            elif isinstance(prop[1], dict):
+                # print("prop[1]",  prop[1].items())
+                for p in prop[1].items():
+                    # print("p", p)
+                    values.append(p[0])
+                    pos.append(p[1])
+                    f_types.append(prop[0])
+            else:
+                raise ValueError(f"prop[1] is not of type 'int' or 'dict'. {prop[1]}")
+
+        pos_to_feats = pd.DataFrame()
+        pos_to_feats["value"] = values
+        pos_to_feats["f_type"] = f_types
+        pos_to_feats.index = pos
+
+        return pos_to_feats
+
 
 class AtomFeaturizer(Featurizer):
     def __init__(self, allowable_sets_one_hot, continuous_props=None):
         super().__init__(allowable_sets_one_hot, continuous_props)
+        self.atomic_feats_pos_values = self.featurizer_to_values()
+
+    ## To Do
+    ## Think of adding an attribute for enhanced node represention
+    # susing specific functional groups. For instance, set
+    # attribute frags_for_nodes = {'frag1':['C#S'], 'primary_alcol':'smarts1',etc...}
+    # The encoding will return a vector of size
+    # len(frags_for_nodes) with values 0 or 1 to
+    # explain whether the atom is part of the
+    # corresponding fragment. The 'frags_for_nodes'
+    # key must be added to the features mapping
 
     def atomic_num(self, atom: Chem.rdchem.Atom):
         return atom.GetAtomicNum()
@@ -173,7 +475,7 @@ class AtomFeaturizer(Featurizer):
         return atom.GetHybridization().name.lower()
 
     def chiral_tag(self, atom: Chem.rdchem.Atom):
-        return int(atom.GetChiralTag())
+        return atom.GetChiralTag().name.lower()
 
     def is_aromatic(self, atom: Chem.rdchem.Atom):
         return atom.GetIsAromatic()
@@ -199,14 +501,166 @@ class AtomFeaturizer(Featurizer):
     def atomic_covalent_radius(self, atom):
         return GetPeriodicTable().GetRcovalent(atom.GetAtomicNum())
 
-    # def electronegativity(self, atom):
-    #     return float(GetPeriodicTable().GetRdkitAtom(atom.GetAtomicNum()).GetProp('_PaulingElectronegativity'))
+    def is_h_acceptor(self, atom):
+        """
+        Is an H acceptor?
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        m = atom.GetOwningMol()
+        idx = atom.GetIdx()
+        return idx in [i[0] for i in Lipinski._HAcceptors(m)]
+
+    def is_h_donor(self, atom):
+        """
+        Is an H donor?
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        m = atom.GetOwningMol()
+        idx = atom.GetIdx()
+        return idx in [i[0] for i in Lipinski._HDonors(m)]
+
+    def is_heteroatom(self, atom):
+        """
+        Is an heteroatom?
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        m = atom.GetOwningMol()
+        idx = atom.GetIdx()
+        return idx in [i[0] for i in Lipinski._Heteroatoms(m)]
+
+    def num_implicit_hydrogens(self, atom):
+        """
+        Number of implicit hydrogens
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        return atom.GetNumImplicitHs()
+
+    def num_explicit_hydrogens(self, atom):
+        """
+        Number of implicit hydrogens
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        return atom.GetNumExplicitHs()
+
+    def crippen_log_p_contrib(self, atom):
+        """
+        Hacky way of getting logP contribution.
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        idx = atom.GetIdx()
+        m = atom.GetOwningMol()
+        if not m.GetPropsAsDict().get("CLogPAtomContribs", None) is None:
+            return ast.literal_eval(m.GetProp("CLogPAtomContribs"))[idx][0]
+        else:
+            warnings.warn(
+                "Owning mol has not calculated CLogPAtomContribs. Calculating now..."
+            )
+            m.SetProp("CLogPAtomContribs", str(Crippen._GetAtomContribs(m)))
+            return ast.literal_eval(m.GetProp("CLogPAtomContribs"))[idx][0]
+
+    def crippen_molar_refractivity_contrib(self, atom):
+        """
+        Hacky way of getting molar refractivity contribution.
+
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        idx = atom.GetIdx()
+        m = atom.GetOwningMol()
+        if not m.GetPropsAsDict().get("CLogPAtomContribs", None) is None:
+            return ast.literal_eval(m.GetProp("CLogPAtomContribs"))[idx][1]
+        else:
+            warnings.warn(
+                "Owning mol has not calculated CLogPAtomContribs. Calculating now..."
+            )
+            m.SetProp("CLogPAtomContribs", str(Crippen._GetAtomContribs(m)))
+            return ast.literal_eval(m.GetProp("CLogPAtomContribs"))[idx][1]
+
+    def tpsa_contrib(self, atom):
+        """
+        Hacky way of getting total polar surface area contribution.
+
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        idx = atom.GetIdx()
+        m = atom.GetOwningMol()
+
+        if not m.GetPropsAsDict().get("TPSAContribs", None) is None:
+            return ast.literal_eval(m.GetProp("TPSAContribs"))[idx]
+        else:
+            warnings.warn(
+                "Owning mol has not calculated AtomContribs. Calculating now..."
+            )
+            m.SetProp("TPSAContribs", str(rdmdesc._CalcTPSAContribs(m)))
+            return ast.literal_eval(m.GetProp("TPSAContribs"))[idx]
+
+    def labute_asa_contrib(self, atom):
+        """
+        Hacky way of getting accessible surface area contribution.
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        idx = atom.GetIdx()
+        m = atom.GetOwningMol()
+
+        if not m.GetPropsAsDict().get("LabuteASAContribs", None) is None:
+            return ast.literal_eval(m.GetProp("LabuteASAContribs"))[0][idx]
+        else:
+            warnings.warn(
+                "Owning mol has not calculated AtomContribs. Calculating now..."
+            )
+            lacontribs = rdmdesc._CalcLabuteASAContribs(m)
+            # print(list(lacontribs[0]))
+            m.SetProp("LabuteASAContribs", str([list(lacontribs[0]), lacontribs[1]]))
+            return ast.literal_eval(m.GetProp("LabuteASAContribs"))[0][idx]
+
+    def gasteiger_charge(self, atom, force_calc=False):
+        """
+        Hacky way of getting gasteiger charge
+        From scikit-learn
+        https://github.com/lewisacidic/scikit-chem/blob/master/skchem/features/atom.py
+        """
+
+        if atom.GetPropsAsDict().get("_GasteigerCharge", None) is None or force_calc:
+            m = atom.GetOwningMol()
+            rdpart.ComputeGasteigerCharges(m)
+            return float(atom.GetProp("_GasteigerCharge"))
+        else:
+            return atom.GetProp("_GasteigerCharge")
 
 
 class BondFeaturizer(Featurizer):
+    ## To Do
+    ## Think of adding an attribute for enhanced bond represention
+    # susing specific functional groups. For instance, set
+    # attribute frags_for_nodes = {'frag1':['C#S'], 'primary_alcol':'smarts1',etc...}
+    # The encoding will return a vector of size
+    # len(frags_for_nodes) with values 0 or 1 to
+    # explain whether the bond is part of the
+    # corresponding fragment. The 'frags_for_nodes'
+    # key must be added to the features mapping
+
     def __init__(self, allowable_sets_one_hot):
+        # allowable_sets_one_hot["bond_none"]={}
         super().__init__(allowable_sets_one_hot)
         self.dim += 1
+        self.bond_feats_pos_values = self.featurizer_to_values()
 
     def encode(self, bond: Chem.rdchem.Bond):
         output = np.zeros((self.dim,))
@@ -239,7 +693,7 @@ class MoleculeFeaturizer(object):
     def __init__(
         self,
         features: List[str] = None,
-        df_func_gps: pd.DataFrame = DF_FUNC_GRPS,
+        df_func_gps: pd.DataFrame = DF_FUNC_GRPS_RDKIT,
         label_col: str = "name",
     ):
         self.dim = 0
@@ -362,7 +816,8 @@ class MoleculeFeaturizer(object):
                     )
 
             fcgps = None
-
+            t0 = time()
+            # print("Performing structure search...")
             if not self.df_func_gps is None:
                 fcgps = get_func_groups_pos_from_mol(
                     molecule,
@@ -382,24 +837,16 @@ class MoleculeFeaturizer(object):
                 if not fcgps is None:
                     properties = dict(properties, **fcgps)
                     len_func_groups = len(fcgps)
-
+            # print(f"Structure search took {time() - t0} sec...")
             # print(f"properties = {properties}")
             if bool(properties):
                 if not as_dict:
                     prop_values = []
 
                     for i in list(properties.values()):
-                        if (
-                            isinstance(i, float)
-                            or isinstance(i, int)
-                            or isinstance(i, bool)
-                        ):
+                        if isinstance(i, (float, int, bool)):
                             prop_values.append(i)
-                        elif (
-                            isinstance(i, list)
-                            or isinstance(i, tuple)
-                            or isinstance(i, set)
-                        ):
+                        elif isinstance(i, (list, tuple, set)):
                             prop_values += list(i)
 
                     return prop_values
@@ -429,17 +876,9 @@ class MoleculeFeaturizer(object):
                 prop_values = []
 
                 for i in list(properties.values()):
-                    if (
-                        isinstance(i, float)
-                        or isinstance(i, int)
-                        or isinstance(i, bool)
-                    ):
+                    if isinstance(i, (list, tuple, set)):
                         prop_values.append(i)
-                    elif (
-                        isinstance(i, list)
-                        or isinstance(i, tuple)
-                        or isinstance(i, set)
-                    ):
+                    elif isinstance(i, (list, tuple, set)):
                         prop_values += list(i)
 
                 return prop_values
@@ -470,8 +909,8 @@ class MoleculeFeaturizer(object):
             return None
 
     def compute_properties_for_mols(self, molecules, as_dataframe: bool = True):
-        # try:
-        if True:
+        try:
+            # if True:
             mordred_features, mordred_descs = [], None
             mols_df = pd.DataFrame(molecules, columns=["RMol"])
             # print(mols_df.head(2))
@@ -483,18 +922,22 @@ class MoleculeFeaturizer(object):
             # print('rdkit_props\n', rdkit_props[0], '\n', rdkit_props.values.tolist())
             t1 = time()
             t_rdkit = t1 - t0
-            print(f"RDKIT property calculation: {round(t_rdkit, 3)} seconds.")
+            # print(f"RDKIT property calculation: {round(t_rdkit, 3)} seconds.")
             rdkit_props_is_all_none = (
                 rdkit_props[0] is None and len(rdkit_props.unique()) == 1
             )
             # print('rdkit_props_is_all_none', rdkit_props_is_all_none)
-            # print('self.mordred_descs', self.mordred_descs)
-            mordred_props_df = self.compute_mordred_props(molecules, self.mordred_descs)
-            t2 = time()
-            t_mordred = t2 - t1
-            print(f"MORDRED property calculation: {round(t_mordred, 3)} seconds.")
-            # print(mordred_props_df is None)
-            # if rdkit_props =
+
+            mordred_props_df = None
+            if not (self.mordred_descs is None or len(self.mordred_descs) == 0):
+                # print('self.mordred_descs', self.mordred_descs)
+                mordred_props_df = self.compute_mordred_props(
+                    molecules, self.mordred_descs
+                )
+                t2 = time()
+                t_mordred = t2 - t1
+                # print(f"MORDRED property calculation: {round(t_mordred, 3)} seconds.")
+                # print(mordred_props_df is None)
 
             properties = None
             if not (rdkit_props_is_all_none or mordred_props_df is None):
@@ -526,9 +969,9 @@ class MoleculeFeaturizer(object):
                     return rdkit_props.values.tolist()
                     # return pd.DataFrame(rdkit_props.values.tolist()).to_dict(orient='records')
 
-        # except Exception as exp:
-        #     print(f"Failed to compute props: {exp}")
-        #     return None
+        except Exception as exp:
+            print(f"Failed to compute props: {exp}")
+            return None
 
 
 ATOMIC_NUM_MAX = 100  ## We only consider atoms with a number of 100 or less (e.g.: 'H':1, 'C':6, 'O':8)
@@ -544,15 +987,26 @@ ATOM_FEATURIZER = AtomFeaturizer(
         "is_in_ring": {True, False},
         "is_in_ring_size_5": {True, False},
         "is_in_ring_size_6": {True, False},
+        "is_h_acceptor": {True, False},
+        "is_h_donor": {True, False},
+        "is_heteroatom": {True, False},
     },
     continuous_props=[
         "atomic_mass",
         "atomic_vdw_radius",
         "atomic_covalent_radius",
+        "num_implicit_hydrogens",
+        "num_explicit_hydrogens",
+        "crippen_log_p_contrib",
+        "crippen_molar_refractivity_contrib",
+        "tpsa_contrib",
+        "labute_asa_contrib",
+        "gasteiger_charge",
     ]  # , 'electronegativity'
     # !!!!!!!!!! CHECK lewisacidic/scikit-chem/skchem/core/atom.py on GitHub FOR MANY ATOM PROPERTIES
     # !!! Also check this for additional properties: https://github.com/firmenich/MultiTask-GNN/blob/master/utils/features.py
 )
+
 
 BOND_FEATURIZER = BondFeaturizer(
     allowable_sets_one_hot={
@@ -568,7 +1022,7 @@ BOND_FEATURIZER = BondFeaturizer(
 
 def get_func_groups_pos_from_mol(
     molecule,
-    df_func_gps: pd.DataFrame = DF_FUNC_GRPS,
+    df_func_gps: pd.DataFrame = DF_FUNC_GRPS_RDKIT,
     as_dict: bool = False,
     label_col: str = "name",
     countUnique: bool = True,
@@ -577,6 +1031,7 @@ def get_func_groups_pos_from_mol(
     try:
         mol = AddHs(molecule)
         for i, smiles in enumerate(df_func_gps["SMARTS"]):
+            # print(df_func_gps.iloc[i]['name'], smiles)
             substruct = Chem.MolFromSmarts(smiles)
             match_pos = mol.GetSubstructMatches(substruct)
             if countUnique:
@@ -591,6 +1046,7 @@ def get_func_groups_pos_from_mol(
             ).to_dict()
     except:
         for i, smiles in enumerate(df_func_gps["SMARTS"]):
+            print(i)
             onehot_func_gps[i] = None
         if not as_dict:
             return onehot_func_gps
@@ -602,7 +1058,7 @@ def get_func_groups_pos_from_mol(
 
 def get_func_groups_pos(
     smiles,
-    df_func_gps: pd.DataFrame = DF_FUNC_GRPS,
+    df_func_gps: pd.DataFrame = DF_FUNC_GRPS_RDKIT,
     as_dict: bool = False,
     label_col: str = "name",
 ):

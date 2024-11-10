@@ -2,15 +2,28 @@ from os import getcwd, makedirs
 from os.path import join, exists, isdir
 from shutil import rmtree
 from sklearn.metrics import r2_score, roc_auc_score, f1_score, mean_squared_error
+from sklearn.metrics._scorer import _PredictScorer
 import torch.optim as optim
 from torch.optim import *
 from torch.optim import lr_scheduler
 from torch.optim.lr_scheduler import *
-from torch.nn import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss, BCELoss, ReLU
-from torch_geometric.loader import DataLoader
+from torch import tensor, argmax
+from torch.nn import (
+    MSELoss,
+    CrossEntropyLoss,
+    BCEWithLogitsLoss,
+    BCELoss,
+    ReLU,
+    functional as F,
+)
+from torch.utils.data import DataLoader
+from torch_geometric.loader import NodeLoader, LinkLoader
 from torch_geometric.data import Data
 from torch.nn.utils import clip_grad_norm_
 import torch
+
+from torch.utils.tensorboard import SummaryWriter
+
 from typing import Optional, Any, Dict, Union
 import numpy as np
 from tqdm import tqdm
@@ -21,13 +34,19 @@ import ast
 from typing import List
 
 
+from optuna.samplers import BaseSampler
+from optuna.pruners import MedianPruner
+from optuna.exceptions import TrialPruned
+from optuna import create_study
+from optuna.trial import TrialState
+
 import sklearn
 from sklearn import utils
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 
 from lib import graph_nns, datasets, predictions
-from lib.utilities import check_if_param_used
+from lib.utilities import check_if_param_used, compute_score
 
 SCORING_FUNC = {
     "regression": {"r2": r2_score, "mse": mean_squared_error},
@@ -50,11 +69,14 @@ class GNNTrainer(object):
         learning_rate=1e-3,
         save_dir: str = None,
         resume: bool = False,
+        # tboard_writer: SummaryWriter  = None,
+        **kwargs
     ):
-        self.task = task
-        self.model = model
+        self.task          = task
+        self.model         = model
         self.learning_rate = learning_rate
-        self.n_epochs = n_epochs
+        self.n_epochs      = n_epochs
+        # self.tboard_writer  = tboard_writer
 
         if isinstance(optimizer, str):
             optimizer_params_dict = ast.literal_eval(optimizer)
@@ -109,9 +131,7 @@ class GNNTrainer(object):
         if self.criterion is None:
             if self.task == "regression":
                 self.criterion = MSELoss()
-            elif self.task == "binary_classification":
-                self.criterion = BCELoss()
-            elif self.task == "multilabel_classification":
+            elif self.task in ["binary_classification", "multilabel_classification"]:
                 self.criterion = BCEWithLogitsLoss()
             elif self.task == "nulticlass_classification":
                 self.criterion = CrossEntropyLoss()
@@ -156,6 +176,7 @@ class GNNTrainer(object):
         scoring_func = params_grid.get("scoring_func", None)
         save_dir = params_grid.get("save_dir", None)
         resume = params_grid.get("resume", False)
+        tboard_writer = params_grid.get("tboard_writer", None)
 
         return cls(
             task=task,
@@ -168,6 +189,7 @@ class GNNTrainer(object):
             learning_rate=learning_rate,
             save_dir=save_dir,
             resume=resume,
+            tboard_writer=tboard_writer
         )
 
     def create_optimizer_from_dict(self, params_dict):
@@ -238,7 +260,7 @@ class GNNTrainer(object):
 
         self.scheduler = eval(params_dict["lr_scheduler_type"])(**new_pd)
 
-    def train(self, train_loader, val_loader, save_every=0, n_epochs=None, device=None):
+    def train(self, train_loader, val_loader, save_every=0, n_epochs=None, device=None, trial=None, tboard_writer:SummaryWriter=None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             # device = 'cpu'
@@ -246,11 +268,13 @@ class GNNTrainer(object):
 
         print(f"device = {device}")
         print(f"TASK: {self.task}")
+        # print(f"MODEL: {self.model}")
 
         val_scores, val_losses, train_losses = [], [], []
         if n_epochs is None:
             n_epochs = self.n_epochs
         for epoch in range(n_epochs):
+            # print(f"\n ************************************** epoch {epoch}")
             train_loss = self.train_epoch(self.model, train_loader, device)
             train_losses.append(train_loss)
 
@@ -258,10 +282,32 @@ class GNNTrainer(object):
             val_losses.append(val_loss)
             val_scores.append(val_score)
 
+            self.learning_rate = self.optimizer.param_groups[0]["lr"]
+
+
             if not self.scheduler is None:
                 # self.scheduler.step()
                 self.scheduler_step(val=val_loss)
-                self.learning_rate = self.optimizer.param_groups[0]["lr"]
+
+            if not trial is None:
+                trial.report(val_loss, epoch)
+
+                if not tboard_writer is None:
+                    # Log metrics for each epoch to TensorBoard
+                    tboard_writer.add_scalar(f"Trial_{trial.number}/Train_Loss", train_loss, epoch)
+                    tboard_writer.add_scalar(f"Trial_{trial.number}/Val_Loss", val_loss, epoch)
+                    tboard_writer.add_scalar(f"Trial_{trial.number}/Val_Score", val_score, epoch)
+                    tboard_writer.add_scalar(f"Trial_{trial.number}/Learning_Rate", self.learning_rate, epoch)
+
+                # Check if trial should be pruned based on intermediate results
+                if trial.should_prune():
+                    tboard_writer.add_text(f"Trial_{trial.number}/Status", "Pruned", epoch)
+                    raise TrialPruned()
+
+
+
+
+
 
             if epoch % 20 == 0 or epoch == self.n_epochs - 1:
                 print(
@@ -289,45 +335,44 @@ class GNNTrainer(object):
 
     def train_epoch(self, model, train_loader, device):
         model.train()
-        losses = []
+        train_losses = []
         batch_nr = 0
+
+        # for batch in tqdm(train_loader):
         for batch in train_loader:
             batch_nr += 1
-            # print(f"Batch {batch_nr}")
-            # for batch in tqdm(train_loader):
+
             batch = batch.to(device)
             output, train_true = predictions.predict_from_batch(
                 batch=batch, model=model, return_true_targets=True
             )
-            # print("\n", f"output[:5] = {output[:5]}\n")
-            # print("\n", f"train_true[:5] = {train_true[:5]}\n")
-            loss = None
+            # print(f"\noutput[:5] = {output[:5]}\ntrain_true[:5] = {train_true[:5]}")
+            train_loss = None
             # print("\n", f"output[:5] = {output[:5]}\n") #, f"torch.max = {torch.max(output[:5], 1)}
-            if self.task in ["binary_classification", "multiclass_classification"]:
-                loss = self.compute_loss(self.criterion, output.squeeze(1), train_true)
-            # if self.task == "binary_classification":
-            #     # print("train_pred", output.squeeze(1))
-            #     loss = self.compute_loss(self.criterion, output.squeeze(1), train_true)
+            # print(f"self.task = {self.task} ({self.task == 'binary_classification'})")
 
-            # elif self.task == "multilabel_classification":
-            #     # _, train_pred = torch.max(output, 1)
-            #     # loss = self.compute_loss(self.criterion, _, train_true)
-            #     loss = self.compute_loss(self.criterion, output.squeeze(1), train_true)
-            #     # print(f"train_pred = {train_pred.shape}", "\n", f"train_true = {train_true.view(-1,1).shape}")
+            if self.task == "binary_classification":
+                # print(f"\nComputing ({self.task}) Loss with {self.criterion}\n")
+                train_loss = self.compute_loss(self.criterion, output, train_true)
+                # print("train loss = ", train_loss)
+
+            elif self.task == "multiclass_classification":
+                train_loss = self.compute_loss(
+                    self.criterion, output, train_true.long()
+                )
 
             elif self.task == "regression":
-                loss = self.compute_loss(self.criterion, output, train_true)
+                train_loss = self.compute_loss(self.criterion, output, train_true)
                 # print(f"output = {output.shape}", "\n", f"train_true = {train_true.view(-1,1).shape}")
 
             else:
                 raise ValueError(f"No implementation for task {self.task}.")
 
-            if not loss is None:
-                # print(f"train_true = {train_true.view(-1,1).shape}")
-                # print(f"Criterion: {self.criterion}")
-                # print(f"Train Loss = {loss}")
-                losses.append(loss.item())
-                loss.backward()
+            # print(f"loss is None: {loss is None}")
+            if not train_loss is None:
+                # print(f"train_true = {train_true.view(-1,1).shape}\nCriterion: {self.criterion}\nTrain Loss = {loss}")
+                train_losses.append(train_loss.item())
+                train_loss.backward()
             else:
                 print(
                     f"There was an issue computing the loss for training batch {batch_nr}. The loss was set to None, and will not be considered for averaging."
@@ -337,7 +382,7 @@ class GNNTrainer(object):
             self.optimizer.step()  ## Update parameters based on gradients.
             self.optimizer.zero_grad()  ## Clear gradients.
 
-        mean_loss = np.array(losses).mean()
+        mean_loss = np.array(train_losses).mean()
 
         return mean_loss
 
@@ -352,77 +397,24 @@ class GNNTrainer(object):
             val_pred, val_true = predictions.predict_from_batch(
                 batch=batch, model=model, return_true_targets=True
             )
-            loss = None
-            score = None
 
-            if self.task in ["binary_classification", "multiclass_classification"]:
-                val_pred = val_pred.squeeze()
-                # print("val_pred", val_pred[:10])
-                loss = self.compute_loss(self.criterion, val_pred, val_true)
-                # if self.task in "binary_classification":
-                #     val_pred = val_pred.squeeze()
-                #     # print("val_pred", val_pred[:10])
-                #     loss = self.compute_loss(self.criterion, val_pred, val_true)
-                # # else:
-                # #     # _, val_pred = torch.max(val_pred, 1)
-                # #     # loss = self.compute_loss(self.criterion, _, val_true)
-                    
-
-                # print(f"val_pred({val_pred.shape}) = {val_pred[:5]}", "\n", f"val_true({val_true.shape}) = {val_true[:5]}")
-                # print(f"Batch {batch_counter}: \n\t{val_pred.tolist()} \n\t{val_true.tolist()}")
-                # print("torch.unique(val_true).size(0)", torch.unique(val_true).size(0))
-                n_true_classes = torch.unique(val_true).size(0)
-
-                # print(f"val_true ({utils.multiclass.type_of_target(val_true.cpu())}) = {val_true}")
-                # # print(f"{utils.multiclass.type_of_target(val_true.cpu())}")
-                # print(f"val_pred ({utils.multiclass.type_of_target(val_pred.cpu())}) = {val_pred}")
-                # # print(f"{utils.multiclass.type_of_target(val_pred.cpu())}")
-
-                if not loss is None:
-                    if n_true_classes > 1:
-                        # print(f"val_pred = {val_pred}")
-                        if self.scoring_func.__name__ in ["roc_auc_score"]:
-                            score = self.scoring_func(
-                                val_true.cpu(), val_pred.detach().cpu()
-                            )
-                            scores.append(score)
-                        elif self.scoring_func.__name__ in [
-                            "balanced_accuracy_score",
-                            "precision_score",
-                            "recall_score",
-                        ]:
-                            ## Classification metrics can't handle a mix of binary and continuous targets
-                            val_pred_classes = None
-                            if self.task == "binary_classification":
-                                val_pred_classes = [
-                                    int(p > threshold) for p in val_pred.detach().cpu()
-                                ]
-                            else:
-                                val_pred_classes = [
-                                    v.index(max(v)) for c in val_pred.detach().cpu()
-                                ]
-
-                            # print('val_pred_classes', val_pred_classes[:10])
-                            # print('val_pred_true', val_true.cpu()[:10])
-                            score = self.scoring_func(val_true.cpu(), val_pred_classes)
-                        # print(f"\tBatch counter {batch_counter}: score = {score}")
-
-                    elif n_true_classes == 1:
-                        if self.scoring_func.__name__ == "roc_auc_score":
-                            warnings.warn(
-                                "Only one class present in y_true. ROC AUC score is not defined in that case. This bastch will be skipped."
-                            )
-                        elif self.scoring_func.__name__ != "roc_auc_score":
-                            warnings.warn(
-                                "Caution. There is only one class, which means the set is missing true positives or true negatives, potentially resulting in values of zero."
-                            )
-
-            elif self.task == "regression":
-                loss = self.compute_loss(self.criterion, val_pred, val_true)
-                score = self.scoring_func(val_true.cpu(), val_pred.detach().cpu())
-                scores.append(score)
-                # print(f"output = {output.shape}", "\n", f"val_true = {val_true.view(-1,1).shape}")
-
+            val_loss = None
+            # print("val_pred = ", val_pred)
+            if self.task in [
+                "binary_classification",
+                "multiclass_classification",
+                "regression",
+            ]:
+                val_loss = self.compute_loss(self.criterion, val_pred, val_true)
+                # print(f"val_loss = {val_loss}")
+                val_score = self.compute_score(
+                    self.scoring_func,
+                    pred_target=val_pred,
+                    true_target=val_true,
+                    task=self.task,
+                )
+                # print(f"\nvalidation score = {val_score}")
+                scores.append(val_score)
             else:
                 raise ValueError(f"No implementation for task {self.task}.")
 
@@ -430,12 +422,12 @@ class GNNTrainer(object):
             # print(f"Criterion: {self.criterion}")
             # print(f"Val Loss = {loss}")
 
-            if not loss is None:
-                losses.append(loss.item())
-                loss.backward()
+            if not val_loss is None:
+                losses.append(val_loss.item())
+                val_loss.backward()
             else:
                 print(
-                    f"There was an issue computing the loss for training batch {batch_counter}. The loss was set to None, and will not be considered for averaging."
+                    f"There was an issue computing the loss for validation batch {batch_counter}. The loss was set to None, and will not be considered for averaging."
                 )
             # print('self.scoring_func', self.scoring_func)
 
@@ -453,71 +445,36 @@ class GNNTrainer(object):
     def set_n_epochs(self, n_epochs):
         self.n_epochs = n_epochs
 
-    # def train_epoch(self, model, train_loader, device):
-    #         model.train()
-    #         train_pred, train_true = predictions.predict_from_loader(train_loader, model=model
-    #                                                                , task=self.task, return_true_targets=True
-    #                                                                , device=device
-    #                                                                , desc="Predicting train targets...")
-    #         # print(f"train_pred = {train_pred.shape}", "\n", f"train_true = {train_true.view(-1,1).shape}")
-    #         # print(f"train_true = {train_true.view(-1,1).shape}")
-    #         # print(f"Criterion: {self.criterion}")
-    #         loss = self.compute_loss(self.criterion, train_pred, train_true)
-    #         # if self.task == 'regression':
-    #         #     loss = self.criterion(train_pred, train_true.view(-1,1))
-    #         #     # loss.backward()
-    #         # else:
-    #         #     loss = self.criterion(train_pred, train_true)
-    #             # loss.backward()
-    #         # loss = self.criterion(train_pred, train_true)
-    #         # loss.backward()
-    #         # print(f"Loss: {loss}")
-    #         loss.backward()
-
-    #         self.optimizer.step() ## Update parameters based on gradients.
-    #         self.optimizer.zero_grad() ## Clear gradients.
-    #         if not self.scheduler is None:
-    #             self.scheduler.step
-
-    #         return loss.item()
-
-    # def validate_epoch(self, model, val_loader, device):
-    #     model.eval()
-    #     val_pred, val_true = predictions.predict_from_loader(val_loader, model=model, task=self.task
-    #                                                        , return_true_targets=True, device=device
-    #                                                        , desc="Predicting validation targets...")
-    #     # loss = None
-    #     # if self.task == 'regression':
-    #     #     loss = self.criterion(val_pred, val_true.view(-1,1))
-    #     # else:
-    #     #     loss = self.criterion(val_pred, val_true)
-    #     loss = self.compute_loss(self.criterion, val_pred, val_true)
-    #     loss.backward()
-    #     # print('self.scoring_func', self.scoring_func)
-    #     score = self.scoring_func(val_pred.detach().cpu(), val_true.cpu())
-
-    #     return loss.item(), score
-
-    def compute_loss(self, criterion, pred_target, true_target):
-        # if True:
-        try:
-            if self.task == "regression":
+    def compute_loss(self, criterion, pred_target, true_target, task=None):
+        task = task or self.task
+        # print(f"task = {task}")
+        if True:
+            # try:
+            if task == "regression":
                 return self.criterion(pred_target, true_target.view(-1, 1))
 
-            elif self.task == "binary_classification":
-                # print(pred_target.shape, true_target.shape)
-                # print([x for x in pred_target.float() if x <0 or x > 1])
-                # print([x for x in true_target if x <0 or x > 1])
-                # print("pred_target:", pred_target.float())
-                # print(true_target)
-                return self.criterion(pred_target.float(), true_target)
+            elif task == "binary_classification":
+                if isinstance(criterion, BCEWithLogitsLoss):
+                    # print(f"self.criterion(pred_target.float(), true_target) = {self.criterion(pred_target.float(), true_target)}")
+                    return self.criterion(pred_target.squeeze(1).float(), true_target)
+                elif isinstance(criterion, BCELoss):
+                    return self.criterion(
+                        F.sigmoid(pred_target).squeeze(1).float(), true_target
+                    )
 
-            elif self.task == "multilabel_classification":
-                return self.criterion(pred_target, true_target)
+            elif task == "multiclass_classification":
+                if not true_target.dtype == torch.long:
+                    true_target = true_target.long()
+                return self.criterion(pred_target.squeeze(1).float(), true_target)
+
             else:
-                raise ValueError("Task not supported for loss computation.")
-        except Exception as exp:
-            return None
+                raise ValueError(f"Task ({task}) not supported for loss computation.")
+        # except Exception as exp:
+        #     return None
+
+    def compute_score(self, scoring_func, pred_target, true_target, task=None):
+        task = task or self.task
+        return compute_score(scoring_func, pred_target, true_target, task)
 
 
 def save_ckpt(
@@ -536,6 +493,7 @@ def save_ckpt(
 
     torch.save(ckpt, file_path)
 
+
 def modules_are_equal(module_1, module_2):
     state_dict1 = module_1.state_dict()
     state_dict2 = module_2.state_dict()
@@ -548,49 +506,71 @@ def modules_are_equal(module_1, module_2):
             if not torch.equal(state_dict1[key], state_dict2[key]):
                 is_equal = False
 
-    
     return is_equal
 
 
 
-import optuna
-from sklearn.metrics._scorer import _PredictScorer
-
-
 class OptunaHPO:
-    def __init__(self, n_trials=5, n_jobs=-1, sampler=None):
+    def __init__(self, n_trials:int=5, n_jobs:int=-1, sampler=None
+                , n_startup_trials:int =1 ## The number of initial trials that won’t be pruned. This helps build up a baseline of performance
+                , n_warmup_steps:int =25  ## The minimum number of reporting steps (i.e.: epochs in this implementation, and not batches.) before a trial can be pruned.
+                , add_tboard_writer:bool = False, tboard_log_dir:str="logs/optuna_hyperparameter_tuning"
+            ):
         self.n_trials = n_trials
-        self.n_jobs   = n_jobs
-        self.sampler  = sampler
-        self.best_model     = None
+        self.n_jobs = n_jobs
+        self.sampler = sampler
+        self.best_model = None
         self.best_val_score = None
         self.train_val_metadata = {
-            "train_losses" : None,
-            "val_losses"   : None,
-            "val_scores"   : None
+            "train_losses": None,
+            "val_losses": None,
+            "val_scores": None,
         }
+        self.n_startup_trials=n_startup_trials
+        self.n_warmup_steps=n_warmup_steps
+        self.add_tboard_writer = add_tboard_writer
+        if self.add_tboard_writer:
+            # Initialize TensorBoard SummaryWriter
+            if tboard_log_dir is None:
+                warnings.warn("The log destination was set to None. It will be set to 'logs/optuna_hyperparameter_tuning' in order to write a summary.")
+                self.tboard_log_dir = "logs/optuna_hyperparameter_tuning"
+            else:
+                self.tboard_log_dir = tboard_log_dir
+            self.tboard_writer = SummaryWriter(log_dir=self.tboard_log_dir)
+            self.tboard_log_dir = tboard_log_dir
+        else:
+            self.tboard_writer = None
+            self.tboard_log_dir=tboard_log_dir
+
 
     def get_params(self):
         return {
             "n_trials": self.n_trials,
             "n_jobs": self.n_jobs,
+            "n_startup_trials": self.n_startup_trials,
+            "n_warmup_steps": self.n_warmup_steps,
             "sampler": self.sampler,
-            "best_model" : self.best_model,
-            "best_val_score": self.best_val_score
-
+            "best_model": self.best_model,
+            "best_val_score": self.best_val_score,
         }
+ 
 
     def train_and_validate(
         self,
+        trial,
         # gnn_trainer: GNNTrainer,
         params: dict,
         dataloaders: List[DataLoader],
         split_mode: str = "classic",
+        # add_tboard_writer: bool = False
     ):
         if split_mode == "classic":
-            
-            gnn_params = {p:params[p] for p in params if check_if_param_used(eval(str(params['model'])), p) }
-           
+            gnn_params = {
+                p: params[p]
+                for p in params
+                if check_if_param_used(eval(str(params["model"])), p)
+            }
+
             gnn_model = eval(f"{str(params['model'])}.from_dict({gnn_params})")
 
             # task = params['task']
@@ -600,41 +580,48 @@ class OptunaHPO:
             gnn_trainer = GNNTrainer.from_dict(params)
 
             train_losses, val_losses, val_scores = gnn_trainer.train(
+                trial=trial,
                 train_loader=dataloaders[0],
                 val_loader=dataloaders[1],
                 save_every=0,
                 n_epochs=None,
+                tboard_writer=self.tboard_writer
             )
 
             val_score = val_scores[-1]
-            print(f"VAL SCORE = {val_score}")
+            # print(f"VAL SCORE = {val_score}")
 
             if self.best_val_score is None:
                 self.best_model = gnn_trainer.model
                 self.best_val_score = val_score
                 self.train_val_metadata = {
-                    "train_losses" : train_losses,
-                    "val_losses"   : val_losses,
-                    "val_scores"   : val_scores
+                    "train_losses": train_losses,
+                    "val_losses": val_losses,
+                    "val_scores": val_scores,
                 }
-                # print("best_val_score = ", self.best_val_score)                
+                # print("best_val_score = ", self.best_val_score)
             elif val_score > self.best_val_score:
-                
-                print(f"\n*** We have a better model with val_score = {val_score} (> {self.best_val_score}) ***\n")
-                print(f"modules_are_equal ={modules_are_equal(self.best_model,gnn_trainer.model)}\n")
+                print(
+                    f"\n*** We have a better model with val_score = {val_score} (> {self.best_val_score}) ***\n"
+                )
+                print(
+                    f"modules_are_equal ={modules_are_equal(self.best_model,gnn_trainer.model)}\n"
+                )
                 self.best_model = gnn_trainer.model
                 self.best_val_score = val_score
                 self.train_val_metadata = {
-                    "train_losses" : train_losses,
-                    "val_losses"   : val_losses,
-                    "val_scores"   : val_scores
+                    "train_losses": train_losses,
+                    "val_losses": val_losses,
+                    "val_scores": val_scores,
                 }
-
 
             return val_score
             # return val_losses[-1]
         else:
-            raise NotImplementedError("train_validate is only implemented for the 'classic' split mode.")
+            raise NotImplementedError(
+                "train_validate is only implemented for the 'classic' split mode."
+            )
+
 
     def objective(
         self,
@@ -647,20 +634,25 @@ class OptunaHPO:
         **kwargs,
     ):
         params = pick_params(trial, params_grid)
-        # print(f"0 params = {params}")
+        print(f"params = {params}\n")
 
         dataloaders = train_val_data
-
-        if not isinstance(train_val_data[0], DataLoader) and isinstance(
-            train_val_data[0][0], Data
-        ):
+        # print(f"dataloaders = {dataloaders}")
+        # print(f"train_val_data[0] = {train_val_data[0]}")
+        # if not isinstance(train_val_data[0], (DataLoader, NodeLoader, LinkLoader)) and isinstance(
+        #     train_val_data[0][0], Data
+        # ):
+        first_batch = next(iter(train_val_data[0]))
+        if not isinstance(
+            train_val_data[0], (DataLoader, NodeLoader, LinkLoader)
+        ) and isinstance(first_batch, Data):
             dl_params = {}
             batch_size = params.get("batch_size", 128)
             shuffle = params.get("shuffle", False)
             add_global_feats_to_nodes = params.get("add_global_feats_to_nodes", False)
             num_workers = params.get("num_workers", 0)
-            standardize = params.get("standardize", True)
-            standardizer = params.get("standardizer", MinMaxScaler())
+            # standardize = params.get("standardize", True)
+            # standardizer = params.get("standardizer", MinMaxScaler())
 
             print("Creating DataLoader objects...")
             train_loader = datasets.get_dataloader(
@@ -669,8 +661,6 @@ class OptunaHPO:
                 shuffle=shuffle,
                 add_global_feats_to_nodes=add_global_feats_to_nodes,
                 num_workers=num_workers,
-                standardize=standardize,
-                standardizer=standardizer,
             )
             val_loader = datasets.get_dataloader(
                 dataset=train_val_data[1],
@@ -678,16 +668,16 @@ class OptunaHPO:
                 shuffle=shuffle,
                 add_global_feats_to_nodes=add_global_feats_to_nodes,
                 num_workers=num_workers,
-                standardize=standardize,
-                standardizer=standardizer,
+                # standardize=standardize,
+                # standardizer=standardizer,
             )
             dataloaders = [train_loader, val_loader]
 
-        params["in_channels"] = list(dataloaders[0])[0].x[0].shape[0]
+        params["in_channels"] = first_batch.x[0].shape[0]
         # params.update(**{'in_channels' : list(dataloaders[0])[0].x[0].shape[0]})
         params["global_fdim"] = (
-            list(dataloaders[0])[0].global_feats.shape[1]
-            if "global_feats" in list(dataloaders[0])[0].to_dict()
+            first_batch.global_feats.shape[1]
+            if hasattr(first_batch, "global_feats")
             else None
         )
         # print("params['in_channels']", params['in_channels'])
@@ -697,14 +687,15 @@ class OptunaHPO:
         # params['model'] = gnn_model
         # gnn_trainer     = GNNTrainer.from_dict(params)
 
-        print(f"params = {params}")
+        # print(f"params = {params}")
         # print("n_epochs", params['n_epochs'])
         # print("model", params['model'])
         # print('gnn_trainer', gnn_trainer.__dict__)
         # print('type', type(dataloaders[0]))
 
-        if isinstance(dataloaders[0], DataLoader):
+        if isinstance(dataloaders[0], (DataLoader, NodeLoader, LinkLoader)):
             val_score = self.train_and_validate(
+                trial=trial,
                 # gnn_trainer = gnn_trainer,
                 dataloaders=dataloaders,
                 params=params,
@@ -712,14 +703,13 @@ class OptunaHPO:
             )
             # print('val_score', val_score)
 
-
-
             return val_score
 
         else:
             raise TypeError(
                 "train_val_data must be of type List[DataLoader] or , List[List[Data]]"
             )
+
 
     def run_optimization(
         self,
@@ -733,8 +723,15 @@ class OptunaHPO:
         study_name: str = None,
         **kwargs,
     ):
-        self.study = optuna.create_study(
-            direction=optuna_direction, sampler=self.sampler, study_name=study_name
+        ## Creating a study
+        ## n_startup_trials = The number of initial trials that won’t be pruned. This helps build up a baseline of performance
+        ## n_warmup_steps: The minimum number of reporting steps (epochs, batches, etc.) before a trial can be pruned. 
+        # This ensures that each trial has a chance to reach some level of maturity.
+        ## one can also consider 'interval_steps' to specify how often to check for pruning    
+        self.study = create_study(
+            direction=optuna_direction, sampler=self.sampler, study_name=study_name,
+            pruner=MedianPruner(n_startup_trials=self.n_startup_trials ##
+                                                , n_warmup_steps=self.n_warmup_steps)
         )
 
         objective = lambda trial: self.objective(
@@ -749,7 +746,7 @@ class OptunaHPO:
         )
 
         objective.best_model = None
-        objective.best_score  = None
+        objective.best_score = None
 
         self.study.optimize(
             objective, n_trials=self.n_trials, n_jobs=self.n_jobs, gc_after_trial=True
@@ -760,6 +757,15 @@ class OptunaHPO:
             "best_score": self.study.best_value,
             # , "gnn_type": gnn_model.__class__.__name__
         }
+
+        # Finalize TensorBoard logging
+        if not self.tboard_writer is None:
+            for trial in self.study.trials:
+                status = "Complete" if trial.state == TrialState.COMPLETE else "Pruned"
+                self.tboard_writer.add_text(f"Trial_{trial.number}/Final_Status", status)
+                self.tboard_writer.add_hparams(trial.params, {"Final_Loss": trial.value or float("inf")})
+            self.tboard_writer.close()
+
 
         return results
 
@@ -775,7 +781,7 @@ def pick_params(trial, params_grid: dict):
 
         elif type(value) == int:
             params[key] = trial.suggest_int(key, value, value)
-
+            # print(key, params[key])
         elif type(value) == float:
             params[key] = trial.suggest_float(key, value, value)
 
@@ -853,7 +859,7 @@ def pick_params(trial, params_grid: dict):
 
         else:
             raise ValueError(f"Invalid values {value}.")
-
+    # print("my params", params)
     return params
 
 

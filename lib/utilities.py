@@ -12,20 +12,23 @@ from sklearn.manifold import TSNE
 
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdmolops
-from rdkit.Chem.AllChem import Mol, GetAtomPairFingerprint, GetMACCSKeysFingerprint, \
-                                     GetTopologicalTorsionFingerprint, GetMorganFingerprint
+from rdkit.Chem.AllChem import (
+    Mol,
+    GetAtomPairFingerprint,
+    GetMACCSKeysFingerprint,
+    GetTopologicalTorsionFingerprint,
+    GetMorganFingerprint,
+)
 
-                                    
 from rdkit.Chem.rdMolDescriptors import (
     GetMorganFingerprint,
     GetAtomPairFingerprint,
     GetTopologicalTorsionFingerprint,
     GetMACCSKeysFingerprint,
-
-    GetMorganFingerprintAsBitVect, 
-    GetMACCSKeysFingerprint, 
-    GetHashedAtomPairFingerprint, 
-    GetHashedTopologicalTorsionFingerprintAsBitVect
+    GetMorganFingerprintAsBitVect,
+    GetMACCSKeysFingerprint,
+    GetHashedAtomPairFingerprint,
+    GetHashedTopologicalTorsionFingerprintAsBitVect,
 )
 from rdkit.Chem import (
     PandasTools,
@@ -37,7 +40,19 @@ from rdkit.Chem import (
 )
 from rdkit.SimDivFilters.rdSimDivPickers import MaxMinPicker
 
-from torch import manual_seed, cuda, backends, Generator, use_deterministic_algorithms, tensor, cat
+from torch import (
+    manual_seed,
+    cuda,
+    backends,
+    Generator,
+    use_deterministic_algorithms,
+    tensor,
+    cat,
+    unique,
+    argmax,
+    Tensor,
+)
+from torch.nn import functional as F
 
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.impute import SimpleImputer
@@ -45,10 +60,13 @@ from sklearn.impute import SimpleImputer
 
 def concat_1d_to_2d_tensor(tensor_1d, tensor_2d):
     # expland tensor_1d (shape = d) using tensor_2d (shape = [n,m])
-    tensor_1d_expanded = tensor_1d.unsqueeze(0).expand(tensor_2d.size(0), -1)  # Shape: [n, d]
+    tensor_1d_expanded = tensor_1d.unsqueeze(0).expand(
+        tensor_2d.size(0), -1
+    )  # Shape: [n, d]
     # Concatenate along the feature dimension (columns)
     t_concat = cat([tensor_2d, tensor_1d_expanded], dim=1)  # Shape: [n, m + d]
     return t_concat
+
 
 def clean_features(features: List[List], feature_scaler=MinMaxScaler()):
     imputer = SimpleImputer(missing_values=np.nan, strategy="mean")
@@ -66,16 +84,17 @@ def check_if_param_used(cls, param_name):
     signature = inspect.signature(cls.__init__)
     return param_name in signature.parameters
 
-def set_seeds(seed: int = None, torch_use_deterministic_algos:bool = True):
+
+def set_seeds(seed: int = None, torch_use_deterministic_algos: bool = True):
     os.environ["PYTHONHASHSEED"] = str(
         seed
     )  # controls the hash seed for hash-based operations so they are reproducible, if seed is not None
 
-    ## ensure deterministic behavior when using CUDA's cuBLAS library, especially for GPU 
+    ## ensure deterministic behavior when using CUDA's cuBLAS library, especially for GPU
     # operations that involve matrix multiplications, convolutions, or other linear algebra computations.
-    # This sets the size of the cuBLAS workspace to 4096 bytes, and maximum number of temporary 
+    # This sets the size of the cuBLAS workspace to 4096 bytes, and maximum number of temporary
     # workspaces that cuBLAS can use to 8.
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # 
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  #
 
     random.seed(seed)
     np.random.seed(seed)
@@ -251,8 +270,9 @@ def min_max_train_test_split_df(
     return dataframe_train, dataframe_test
 
 
-def calculate_fingerprints_as_bits(molecules, fingerprint_type="morgan", radius=2, nBits=1024):
-
+def calculate_fingerprints_as_bits(
+    molecules, fingerprint_type="morgan", radius=2, nBits=1024
+):
     valid_fingerprints = ["morgan", "avalon", "atom-pair", "maccs", "top_torso"]
 
     if fingerprint_type not in valid_fingerprints:
@@ -264,9 +284,7 @@ def calculate_fingerprints_as_bits(molecules, fingerprint_type="morgan", radius=
     if fingerprint_type == "morgan":
 
         def fp_generator(mol):  # Pass the molecule as an argument
-            return GetMorganFingerprintAsBitVect(
-                mol, radius=radius, nBits=nBits
-            )
+            return GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=nBits)
 
     elif fingerprint_type == "avalon":
 
@@ -286,7 +304,7 @@ def calculate_fingerprints_as_bits(molecules, fingerprint_type="morgan", radius=
     elif fingerprint_type == "top_torso":
 
         def fp_generator(mol):
-            return GetHashedTopologicalTorsionFingerprintAsBitVect(mol)        
+            return GetHashedTopologicalTorsionFingerprintAsBitVect(mol)
 
     else:
         raise ValueError(
@@ -299,13 +317,17 @@ def calculate_fingerprints_as_bits(molecules, fingerprint_type="morgan", radius=
     return fingerprints
 
 
-def get_fingerprints(list_of_rdkit_molecules,fp_type="morgan"):
+def get_fingerprints(list_of_rdkit_molecules, fp_type="morgan"):
     """
     fp_types = { "morgan": "GetMorganFingerprint", "atom_pair": "GetAtomPairFingerprint", "top_torso": "GetTopologicalTorsionFingerprint"}
-    """   
+    """
 
     fps = None
-    assert fp_type in ["morgan", "atom_pair", "top_torso"], "ValueError: The supported fingerprint types are morgan, atom_pair, and top_torso (for topological_torsiopnal)"
+    assert fp_type in [
+        "morgan",
+        "atom_pair",
+        "top_torso",
+    ], "ValueError: The supported fingerprint types are morgan, atom_pair, and top_torso (for topological_torsiopnal)"
     if fp_type == "morgan":
         fps = [GetMorganFingerprint(x, 3) for x in list_of_rdkit_molecules]
     elif fp_type == "atom_pair":
@@ -314,7 +336,6 @@ def get_fingerprints(list_of_rdkit_molecules,fp_type="morgan"):
         fps = [GetTopologicalTorsionFingerprint(x) for x in list_of_rdkit_molecules]
 
     return fps
-
 
 
 def min_max_train_test_split(
@@ -331,8 +352,9 @@ def min_max_train_test_split(
     picker = MaxMinPicker()
     fps = None
 
-    fps = get_fingerprints(list_of_rdkit_molecules=list_of_rdkit_molecules
-                            , fp_type=fp_type)
+    fps = get_fingerprints(
+        list_of_rdkit_molecules=list_of_rdkit_molecules, fp_type=fp_type
+    )
 
     nfps = len(fps)
     n_training_compounds = round(nfps * (1 - test_ratio))
@@ -609,3 +631,95 @@ def min_max_train_validate_test_split(
         return None
 
 
+def compute_score(scoring_func, pred_target, true_target, task):
+    # if True:
+    try:
+        assert not task is None, "ValueError: the parameter 'task' must be non-null."
+
+        if task in ["binary_classification", "multiclass_classification"]:
+            n_true_classes = unique(true_target).size(0)
+            score = None
+            if n_true_classes > 1:
+                # print("pred_target[:2]", pred_target[:2])
+
+                pred_target_probas = None
+                if task == "binary_classification":
+                    pred_target_probas = F.sigmoid(pred_target)
+                elif task == "multiclass_classification":
+                    pred_target_probas = F.softmax(pred_target, dim=1)
+
+                # print(f"pred_target_probas = {pred_target_probas}")
+
+                if scoring_func.__name__ in ["roc_auc_score"]:
+                    score = scoring_func(
+                        y_true=true_target.cpu(),
+                        y_score=pred_target_probas.detach().cpu(),
+                        multi_class="ovr",
+                    )
+                elif scoring_func.__name__ == "log_loss":
+                    score = scoring_func(
+                        y_true=true_target.cpu(),
+                        y_red_proba=pred_target_probas.detach().cpu(),
+                        normalize=True,
+                    )
+                elif scoring_func.__name__ in [
+                    "balanced_accuracy_score",
+                    "precision_score",
+                    "recall_score",
+                    "f1_score",
+                ]:
+                    ## Classification metrics can't handle a mix of binary and continuous targets
+                    pred_target_classes = argmax(pred_target_probas, dim=1)
+                    # print('pred_target_classes[:]', pred_target_classes[:].shape)
+                    # print('true_target', true_target.long().shape)
+
+                    if (
+                        task == "multiclass_classification"
+                        and scoring_func.__name__
+                        in ["precision_score", "recall_score", "f1_score"]
+                    ):
+                        ## We default to a weighted average for multiclass classification
+                        score = scoring_func(
+                            y_true=true_target.cpu().long(),
+                            y_pred=pred_target_classes,
+                            average="weighted",
+                        )
+                    else:
+                        score = scoring_func(
+                            y_true=true_target.cpu(), y_pred=pred_target_classes
+                        )
+                else:
+                    raise NotImplementedError(
+                        f"Scoring function {scoring_func.__name__} not yet supported."
+                    )
+
+            elif n_true_classes == 1:
+                if scoring_func.__name__ == "roc_auc_score":
+                    warnings.warn(
+                        "Only one class present in y_true. ROC AUC score is not defined in that case. This bastch will be skipped."
+                    )
+                elif scoring_func.__name__ != "roc_auc_score":
+                    warnings.warn(
+                        "Caution. There is only one class, which means the set is missing true positives or true negatives, potentially resulting in values of zero."
+                    )
+        elif task == "regression":
+            score = scoring_func(true_target.cpu(), pred_target.detach().cpu())
+
+        return score
+    except Exception as exp:
+        print(f"Failed to compute {scoring_func.__name__}.\n\t{exp}")
+
+
+def min_max_normalize(tensor: Tensor, epsilon: float = 1e-10) -> Tensor:
+    """
+    Normalize a tensor to the range [0, 1] using min-max scaling.
+
+    Args:
+        tensor (torch.Tensor): The input tensor to normalize.
+        epsilon (float): A small constant to prevent division by zero.
+
+    Returns:
+        torch.Tensor: The min-max normalized tensor.
+    """
+    min_val, max_val = tensor.min(), tensor.max()
+    return (tensor - min_val) / (max_val - min_val + epsilon)

@@ -5,7 +5,12 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.impute import SimpleImputer
 from torch_geometric.data import Data, Batch
-from torch_geometric.loader import DataLoader
+
+# from torch_geometric.loader import DataLoader
+
+## torch.utils.data with collate_fn and Collater. It seems PyG removed collate_fn and replaced with Collater.
+# but I could not get the proper behavior
+from torch.utils.data import DataLoader
 from torch import tensor, cat, stack, as_tensor, set_printoptions
 import time
 
@@ -61,6 +66,23 @@ def split_data(
     return train_data, val_data, test_data
 
 
+## Custom PyTorch Collate Function: https://lukesalamone.github.io/posts/custom-pytorch-collate/
+class CustomCollater:
+    def __init__(self, follow_batch=[]):
+        self.follow_batch = follow_batch
+
+    def __call__(self, batch):
+        # Stack and batch standard attributes with PyG's Batch class
+        batch_graph = Batch.from_data_list(batch, follow_batch=self.follow_batch)
+        # print("batch_graph", batch_graph)
+        # Handle `global_feats` if it exists
+        if "global_feats" in batch[0]:
+            global_feats = stack([data.global_feats for data in batch])
+            batch_graph.global_feats = global_feats
+        else:
+            batch_graph.global_feats = None
+
+        return batch_graph
 
 
 def get_dataloader(
@@ -68,13 +90,14 @@ def get_dataloader(
     batch_size=128,
     shuffle: bool = False,
     add_global_feats_to_nodes: bool = False,
-    num_workers: int = 0,    
-
+    num_workers: int = 0,
+    colllater: CustomCollater = CustomCollater(),
 ):
     if add_global_feats_to_nodes:
         dataset = gnn_utils.add_global_features_to_nodes(data=dataset)
         print("dataset after adding global feat: ", dataset)
-    
+    # elif has_attr(dataset, 'global_feats'):
+
     pin_memory = False
     if num_workers > 0:
         pin_memory = True
@@ -85,7 +108,27 @@ def get_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-    )   
+        collate_fn=colllater,
+    )
+
+
+class CustomCollater:
+    def __init__(self, follow_batch=[]):
+        self.follow_batch = follow_batch
+
+    def __call__(self, batch):
+        # Stack and batch standard attributes with PyG's Batch class
+        batch_graph = Batch.from_data_list(batch, follow_batch=self.follow_batch)
+
+        # Handle `global_feats` if it exists
+        if "global_feats" in batch[0]:
+            global_feats = stack([data.global_feats for data in batch])
+            batch_graph.global_feats = global_feats
+        else:
+            batch_graph.global_feats = None  # None if not present
+
+        return batch_graph
+
 
 def get_dataloaders(
     train_data: List[Data],
@@ -96,12 +139,14 @@ def get_dataloaders(
     add_global_feats_to_nodes: bool = False,
     num_workers: int = 0,
 ):
+    custom_collater = CustomCollater()
     train_dataloader = get_dataloader(
         dataset=train_data,
         batch_size=batch_size,
         shuffle=shuffle_train,
         add_global_feats_to_nodes=add_global_feats_to_nodes,
         num_workers=num_workers,
+        colllater=custom_collater,
     )
 
     test_dataloader = get_dataloader(
@@ -109,6 +154,7 @@ def get_dataloaders(
         batch_size=batch_size,
         add_global_feats_to_nodes=add_global_feats_to_nodes,
         num_workers=num_workers,
+        colllater=custom_collater,
     )
 
     if val_data is None:
@@ -118,6 +164,7 @@ def get_dataloaders(
             dataset=val_data,
             batch_size=batch_size,
             add_global_feats_to_nodes=add_global_feats_to_nodes,
-            num_workers=num_workers
+            num_workers=num_workers,
+            colllater=custom_collater,
         )
         return train_dataloader, val_dataloader, test_dataloader

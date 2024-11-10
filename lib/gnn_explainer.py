@@ -113,9 +113,9 @@ class GNNExplainerModule:
         node_set: Optional[Set[int]] = None,
         edge_set: Optional[Set[int]] = None,
         title: Optional[str] = None,
-        figsize: Optional[Tuple] = (8,6),
+        figsize: Optional[Tuple] = (8, 6),
         node_size: int = 300,
-        edge_width: int = 6
+        edge_width: int = 6,
     ) -> None:
         """Visualizes a subgraph explanation for a graph.
 
@@ -190,9 +190,9 @@ class GNNExplainerModule:
         threshold: float = 0.5,
         device: str = "cpu",
         remove_self_loops: bool = True,
-        figsize: Optional[Tuple] = (8,6),
+        figsize: Optional[Tuple] = (8, 6),
         node_size: int = 300,
-        edge_width: int = 6
+        edge_width: int = 6,
     ) -> None:
         """Visualizes the explanations of GNNExplainer for a graph given a mask threshold."""
         device = device or self.device
@@ -222,7 +222,6 @@ class GNNExplainerModule:
             edge_attrs=["edge_attr"],
             to_undirected=False,
             remove_self_loops=remove_self_loops,
-            
         )
 
         if "y" in my_data:
@@ -232,7 +231,7 @@ class GNNExplainerModule:
                 edge_set=edge_set,
                 title=f"GNNExplainer on graph : label = {my_data.y.item()}, pred = {pred[0][0]:.2f}",
                 node_size=node_size,
-                edge_width=edge_width
+                edge_width=edge_width,
             )
         else:
             self.visualize_subgraph(
@@ -240,12 +239,17 @@ class GNNExplainerModule:
                 edge_set=edge_set,
                 title=f"GNNExplainer on graph : pred = {pred[0][0]:.2f}",
                 node_size=node_size,
-                edge_width=edge_width                
+                edge_width=edge_width,
             )
 
     def interactive_explanation_viz_for_graphs(
-        self, graphs: List[Data], max_num: int = 25, threshold: float = 0.5, device=None,
-                        node_size: int = 300, edge_width: int = 6
+        self,
+        graphs: List[Data],
+        max_num: int = 25,
+        threshold: float = 0.5,
+        device=None,
+        node_size: int = 300,
+        edge_width: int = 6,
     ):
         device = device or self.device
         max_num = min(len(graphs), max_num)
@@ -263,8 +267,7 @@ class GNNExplainerModule:
                 device=device,
                 remove_self_loops=True,
                 node_size=node_size,
-                edge_width=edge_width
-
+                edge_width=edge_width,
             )
 
     ### Predict via Subgraph Counts
@@ -351,28 +354,37 @@ class GNNExplainerModule:
 
         return subgraphs_sorted, coefficients_sorted
 
-    def visualize_top_k_subgraphs(self, k: int = 5, node_size: int = 300, edge_width: int = 6):
+    def visualize_top_k_subgraphs(
+        self, k: int = 5, node_size: int = 300, edge_width: int = 6
+    ):
         subgraphs_sorted, coefficients_sorted = self.identify_most_important_subgraphs()
 
         for i in range(k):
             self.visualize_subgraph(
                 graph=subgraphs_sorted[i],
                 title=f"Subgraph {i + 1} with coefficient = {coefficients_sorted[i]:.2f}",
-                node_size=node_size, edge_width=edge_width
+                node_size=node_size,
+                edge_width=edge_width,
             )
 
     ## This is suited for binary graph classification
     def visualize_subgraphx_explanations(
-        self, dataset: List[Data], device: str = "cpu", num_nodes: int = 10, 
+        self,
+        dataset: List[Data],
+        device: str = "cpu",
+        num_nodes: int = 10,
         c_puct: float = 10.0,
         num_expand_nodes: int = 14,
         high2low: bool = False,
-        node_size: int = 300, edge_width: int = 6
+        node_size: int = 300,
+        edge_width: int = 6,
     ):
         subgraphx = graph_utils.SubgraphX(
-            model=self.gnn_predictor.model.to(device), min_nodes=num_nodes,
-            c_puct=c_puct, num_expand_nodes=num_expand_nodes,
-            high2low=high2low
+            model=self.gnn_predictor.model.to(device),
+            min_nodes=num_nodes,
+            c_puct=c_puct,
+            num_expand_nodes=num_expand_nodes,
+            high2low=high2low,
         )
 
         for i, data in enumerate(dataset):
@@ -394,25 +406,30 @@ class GNNExplainerModule:
                     graph=graph,
                     node_set=set(subgraph.coalition),
                     title=f"SubgraphX on graph {i} : label = {data.y.item()}",
-                    node_size=node_size, 
-                    edge_width=edge_width
+                    node_size=node_size,
+                    edge_width=edge_width,
                 )
             else:
                 self.visualize_subgraph(
                     graph=graph,
                     node_set=set(subgraph.coalition),
                     title=f"SubgraphX on graph {i}",
-                    node_size=node_size, 
-                    edge_width=edge_width
+                    node_size=node_size,
+                    edge_width=edge_width,
                 )
 
     def interactive_subgraphx_based_explanation_viz_for_graphs(
-        self, dataset: List[Data], device: str = "cpu", num_nodes: int = 10, 
+        self,
+        dataset: List[Data],
+        device: str = "cpu",
+        num_nodes: int = 10,
         c_puct: float = 10.0,
         num_expand_nodes: int = 14,
         high2low: bool = False,
-        max_num: int = 25, threshold: float = 0.5,
-        node_size: int = 300, edge_width: int = 6
+        max_num: int = 25,
+        threshold: float = 0.5,
+        node_size: int = 300,
+        edge_width: int = 6,
     ):
         device = device or self.device
         max_num = min(len(dataset), max_num)
@@ -423,8 +440,10 @@ class GNNExplainerModule:
             threshold=widgets.FloatSlider(value=0.5, min=0.0, max=1.0, step=0.01),
             graph_idx=widgets.IntSlider(value=0, min=0, max=max_num),
         )
-        def interactive_subgraphx_based_class_explanations(graph_idx: int, threshold: float):
-            self.visualize_subgraphx_explanations(                
+        def interactive_subgraphx_based_class_explanations(
+            graph_idx: int, threshold: float
+        ):
+            self.visualize_subgraphx_explanations(
                 dataset=[dataset[graph_idx]],
                 device=device,
                 num_nodes=num_nodes,
@@ -432,8 +451,7 @@ class GNNExplainerModule:
                 num_expand_nodes=num_expand_nodes,
                 high2low=high2low,
                 node_size=node_size,
-                edge_width=edge_width
-
+                edge_width=edge_width,
             )
 
 

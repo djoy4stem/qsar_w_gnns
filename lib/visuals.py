@@ -1,13 +1,23 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from sklearn.manifold import TSNE
 from umap import UMAP
 import seaborn as sns
+from io import BytesIO
+from PIL import Image
+
+
+from rdkit import Chem
+from rdkit.Chem import Draw
+from rdkit.Chem.Draw import rdMolDraw2D
+
 
 import networkx as nx
 
 from typing import List, Union, Tuple
+from lib import featurizers
 
 
 #######################################
@@ -102,7 +112,15 @@ def visualize_colored_graph(edge_index, edge_mask, data, threshold=0.5):
     plt.show()
 
 
-def reduce_and_plot(data, actuals=None, method='umap', n_components=2, figsize=(10, 8), random_state=42, **kwargs):
+def reduce_and_plot(
+    data,
+    actuals=None,
+    method="umap",
+    n_components=2,
+    figsize=(10, 8),
+    random_state=42,
+    **kwargs,
+):
     """
     Reduces dimensionality of data using UMAP or t-SNE and plots it.
 
@@ -117,49 +135,193 @@ def reduce_and_plot(data, actuals=None, method='umap', n_components=2, figsize=(
     Returns:
     - embedding: numpy array of shape (n_samples, n_components), the reduced data
     """
-    if method == 'umap':
+    if method == "umap":
         ## To ensure deterministic results, make sure to set the random state and transform_seed variables
-        # According to the 2022 discussion below below, they do not have a big impact. But my visual inspection 
+        # According to the 2022 discussion below below, they do not have a big impact. But my visual inspection
         # on datasets in 2024 show they do. The issue has been close since then.
         # https://github.com/lmcinnes/umap/issues/158#issuecomment-472220347
         # Also check UMAP Reproducibility at https://umap-learn.readthedocs.io/en/latest/reproducibility.html
 
-        reducer = UMAP(n_components=n_components, random_state=random_state, transform_seed=random_state, **kwargs)
+        reducer = UMAP(
+            n_components=n_components,
+            random_state=random_state,
+            transform_seed=random_state,
+            **kwargs,
+        )
 
-    
-    elif method == 'tsne':
-        ## 
+    elif method == "tsne":
+        ##
         # 1) Mastering t-SNE(t-distributed stochastic neighbor embedding):
         #   https://medium.com/@sachinsoni600517/mastering-t-sne-t-distributed-stochastic-neighbor-embedding-0e365ee898ea
         # 2) https://www.datacamp.com/tutorial/introduction-t-sne
         # 3) https://distill.pub/2016/misread-tsne/
-        
+
         reducer = TSNE(n_components=n_components, random_state=random_state, **kwargs)
     else:
         raise ValueError("Invalid method. Choose either 'umap' or 'tsne'.")
 
     # Fit and transform the data
-    if method == 'tsne' and isinstance(data, (List, np.ndarray)) and isinstance(data[0], (List, np.ndarray)):
-            embedding = reducer.fit_transform(pd.DataFrame(data))
+    if (
+        method == "tsne"
+        and isinstance(data, (List, np.ndarray))
+        and isinstance(data[0], (List, np.ndarray))
+    ):
+        embedding = reducer.fit_transform(pd.DataFrame(data))
     else:
         embedding = reducer.fit_transform(data)
 
     # Plotting the results
     plt.figure(figsize=figsize)
     if actuals is not None:
-        sns.scatterplot(x=embedding[:, 0], y=embedding[:, 1], hue=actuals, palette="viridis", s=60, alpha=0.8)
+        sns.scatterplot(
+            x=embedding[:, 0],
+            y=embedding[:, 1],
+            hue=actuals,
+            palette="viridis",
+            s=60,
+            alpha=0.8,
+        )
         plt.legend(title="Classes")
     else:
         plt.scatter(embedding[:, 0], embedding[:, 1], s=60, alpha=0.8)
-    plt.title(f'{method.upper()} projection')
-    plt.xlabel('Component 1')
-    plt.ylabel('Component 2')
+    plt.title(f"{method.upper()} projection")
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
     plt.show()
 
     return embedding
 
 
-def plot_embeddings(model, data, actuals=None, method='umap', n_components=2, **kwargs):
-
+def plot_embeddings(model, data, actuals=None, method="umap", n_components=2, **kwargs):
     h = model(data)
-    reduce_and_plot(data=data, actuals=actuals, method=methods, n_components=n_components, **kwargs)
+    reduce_and_plot(
+        data=data, actuals=actuals, method=methods, n_components=n_components, **kwargs
+    )
+
+
+# def get_color_from_contribution(contribution, max_contribution, scale_type="linear"):
+#     normalized = contribution/max_contribution
+#     if scale_type== "log":
+#         normalized = np.log1p(contribution)/np.log1p(max_contribution)
+
+#     return (1.0, 0.2 * (1 - normalized), 0.6 * (1 - normalized), 0.4)  # RGB with transparency
+
+
+def get_color_from_contribution(contribution, **kwargs):
+    ## https://rgbacolorpicker.com/
+    code = (1, 0, 0, 0.6)
+    if contribution < 0.3:
+        ## red-ish ##
+        code = (1, 0, 0, 0.6)
+    elif contribution < 0.5:
+        ## purple-ish ##
+        code = (1, 0, 1, 0.4)
+    elif contribution < 0.8:
+        ## yello-ish ##
+        # code = (228/255,1,0,0.4)
+        code = (210 / 255, 190 / 255, 0, 0.4)
+    else:
+        ## green ##
+        code = (0, 1, 0, 0.4)
+
+    return code
+
+
+# Visualization function to highlight substructures with gradient colors based on importance
+def visualize_molecule_with_importance_gradient(
+    smiles,
+    contributions,
+    func_groups: Union[List, str],
+    threshold=0.5,
+    scale_type="log",
+):
+    mol = Chem.MolFromSmiles(smiles)
+    substructures = featurizers.get_substructures(func_groups=func_groups)
+
+    highlight_atoms = set()
+    atom_colors = {}
+    substructure_contributions = {}
+
+    # Find the maximum contribution for scaling colors
+    relevant_contributions = [
+        contributions[pair[1]].item()
+        for bit, _, pair in substructures
+        if contributions[pair[1]] > threshold
+    ]
+    if len(relevant_contributions) > 0:
+        max_contribution = max(relevant_contributions)
+    else:
+        max_contribution = max(
+            contributions[pair[1]].item() for bit, _, pair in substructures
+        )
+
+    # Match MACCS bits to substructures and aggregate contributions
+    for bit, substructure, pair in substructures:
+        bit_idx = pair[1]
+        if (
+            substructure and contributions[bit_idx] > threshold
+        ):  # Filter based on threshold
+            matches = mol.GetSubstructMatches(substructure)
+            if matches:
+                contribution_value = contributions[bit_idx].item()
+                substructure_contributions[bit_idx] = (
+                    bit,
+                    contribution_value,
+                )  # Store contribution for the legend
+                # color_with_alpha = get_color_from_contribution(contribution_value, max_contribution, scale_type=scale_type)
+                color_with_alpha = get_color_from_contribution(contribution_value)
+                for match in matches:
+                    for atom_idx in match:
+                        highlight_atoms.add(atom_idx)
+                        atom_colors[atom_idx] = color_with_alpha  # Assign color to atom
+
+    # Draw molecule with highlighted atoms
+    drawer = rdMolDraw2D.MolDraw2DCairo(500, 400)
+    opts = drawer.drawOptions()
+    opts.atomHighlightsAreCircles = True
+
+    drawer.DrawMolecule(
+        mol, highlightAtoms=highlight_atoms, highlightAtomColors=atom_colors
+    )
+    drawer.FinishDrawing()
+
+    # Convert the drawing to an image
+    png_data = drawer.GetDrawingText()
+    img = Image.open(BytesIO(png_data))
+
+    # Prepare the legend to show color range for contributions
+    # legend_patches = [
+    #     Patch(color=get_color_from_contribution(contribution[1], max_contribution),
+    #         #   label=f"Importance {bit}: {contribution:.2f}")
+    #         # label=f"Substructure {contribution[0]}: {contribution[1]:.2f}")
+    #         label=f"{contribution[0]}: {contribution[1]:.2f}")
+    #     for bit, contribution in substructure_contributions.items()
+    # ]
+    legend_patches = [
+        Patch(
+            color=get_color_from_contribution(contribution[1]),
+            #   label=f"Importance {bit}: {contribution:.2f}")
+            # label=f"Substructure {contribution[0]}: {contribution[1]:.2f}")
+            label=f"{contribution[0]}: {contribution[1]:.2f}",
+        )
+        for bit, contribution in substructure_contributions.items()
+    ]
+
+    # Plot image with substructure contributions as legend
+    plt.figure(figsize=(6, 5))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.title(
+        "Molecule with Highlighted Substructure Contributions (Importance Gradient)"
+    )
+
+    # Add a legend with color-coded substructure contributions
+    plt.legend(
+        handles=legend_patches,
+        loc="center left",
+        fontsize=10,
+        bbox_to_anchor=(1.0, 0.5),
+        borderaxespad=0,
+    )
+
+    plt.show()
