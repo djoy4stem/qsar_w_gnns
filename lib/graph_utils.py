@@ -25,6 +25,7 @@ import networkx.algorithms.isomorphism as iso
 from collections import Counter
 
 from torch_geometric.nn.conv import MessagePassing
+from lib import graph_nns
 
 
 # from rdkit import Chem, RDLogger
@@ -394,17 +395,54 @@ def gnn_score(coalition: Tuple[int, ...], data: Data, model: torch.nn.Module) ->
     node_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=data.x.device)
     node_mask[list(coalition)] = 1
 
+    # print("coalition", coalition)
+    # print("node_mask", node_mask)
+
     row, col = data.edge_index
+    # print("row=", row)
+    # print("col=", col)
+    # print("node_mask[row]=", node_mask[row])
     edge_mask = (node_mask[row] == 1) & (node_mask[col] == 1)
+    # print(f"edge_mask ({edge_mask.shape})", edge_mask)
 
     mask_edge_index = data.edge_index[:, edge_mask]
+    # print("mask_edge_mask", mask_edge_index)
 
-    mask_data = Data(x=data.x, edge_index=mask_edge_index)
-    mask_data = Batch.from_data_list([mask_data])
+    mask_global_feats = data.to_dict().get('global_feats', None)
 
-    logits = model(
-        x=mask_data.x, edge_index=mask_data.edge_index, batch=mask_data.batch
-    )
+
+
+
+
+    logits=None
+
+    # if not mask_edge_attr is None:
+    if model.can_use_edge_attr:
+        mask_edge_attr = data.to_dict().get('edge_attr', None)
+        if not mask_edge_attr is None:
+            # print(f"mask_edge_attr ({mask_edge_attr.shape})=",mask_edge_attr)
+            mask_edge_attr =  mask_edge_attr[edge_mask, :]
+
+
+        mask_data = Data(x=data.x, edge_index=mask_edge_index, global_feats=mask_global_feats,
+                            edge_attr=mask_edge_attr)
+
+        mask_data = Batch.from_data_list([mask_data])
+
+        # print("mask_edge_attr", mask_data.edge_attr.shape)
+        logits = model(
+            x=mask_data.x, edge_index=mask_data.edge_index, batch=mask_data.batch,
+            global_feats = mask_data.to_dict().get('global_feats', None), edge_attr=mask_data.edge_attr
+        )
+    else:      
+        mask_data = Data(x=data.x, edge_index=mask_edge_index, global_feats=mask_global_feats)
+
+        mask_data = Batch.from_data_list([mask_data])
+
+        logits = model(
+            x=mask_data.x, edge_index=mask_data.edge_index, batch=mask_data.batch,
+            global_feats = mask_data.to_dict().get('global_feats', None)
+        )        
     score = torch.sigmoid(logits).item()
 
     return score
@@ -447,6 +485,9 @@ class MCTS(object):
         c_puct: float,
         num_expand_nodes: int,
         high2low: bool,
+        global_feats: LongTensor = None,
+        edge_attr: LongTensor = None
+
     ) -> None:
         """Creates the Monte Carlo Tree Search (MCTS) object.
 
@@ -463,9 +504,12 @@ class MCTS(object):
         """
         self.x = x
         self.edge_index = edge_index
+        self.global_feats = global_feats
+        self.edge_attr = edge_attr
         self.model = model
         self.num_hops = num_hops
-        self.data = Data(x=self.x, edge_index=self.edge_index)
+        self.data = Data(x=self.x, edge_index=self.edge_index, 
+                            global_feats=self.global_feats, edge_attr=self.edge_attr)
         self.graph = to_networkx(
             Data(x=self.x, edge_index=remove_self_loops(self.edge_index)[0]),
             to_undirected=True,
@@ -542,6 +586,7 @@ class MCTS(object):
             # For each child in the tree, compute its reward using the GNN
             for child in tree_node.children:
                 if child.P == 0:
+                    # print("child.data", child.data)
                     child.P = gnn_score(
                         coalition=child.coalition, data=child.data, model=self.model
                     )
@@ -613,7 +658,7 @@ class SubgraphX(object):
         self.num_expand_nodes = num_expand_nodes
         self.high2low = high2low
 
-    def explain(self, x: Tensor, edge_index: Tensor, max_nodes: int) -> MCTSNode:
+    def explain(self, x: Tensor, edge_index: Tensor, max_nodes: int, global_feats: Tensor=None, edge_attr: Tensor=None) -> MCTSNode:
         """Explain the GNN behavior for the graph using the SubgraphX method.
 
         :param x: Node feature matrix with shape [num_nodes, dim_node_feature].
@@ -626,6 +671,8 @@ class SubgraphX(object):
         mcts = MCTS(
             x=x,
             edge_index=edge_index,
+            global_feats=global_feats,
+            edge_attr=edge_attr,
             model=self.model,
             num_hops=self.num_hops,
             n_rollout=self.n_rollout,

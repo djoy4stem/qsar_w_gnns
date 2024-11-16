@@ -119,6 +119,7 @@ def reduce_and_plot(
     n_components=2,
     figsize=(10, 8),
     random_state=42,
+    title=None,
     **kwargs,
 ):
     """
@@ -184,7 +185,11 @@ def reduce_and_plot(
         plt.legend(title="Classes")
     else:
         plt.scatter(embedding[:, 0], embedding[:, 1], s=60, alpha=0.8)
-    plt.title(f"{method.upper()} projection")
+
+    if title is None:
+        title = f"{method.upper()} projection"
+        
+    plt.title(title)
     plt.xlabel("Component 1")
     plt.ylabel("Component 2")
     plt.show()
@@ -243,11 +248,21 @@ def visualize_molecule_with_importance_gradient(
     substructure_contributions = {}
 
     # Find the maximum contribution for scaling colors
+    # print(substructures)
+    # print(len(contributions))
     relevant_contributions = [
         contributions[pair[1]].item()
         for bit, _, pair in substructures
         if contributions[pair[1]] > threshold
     ]
+    # relevant_contributions=[]
+    # for bit, _, pair in substructures:
+    #     print("pair", pair)
+    #     if contributions[pair[1]] > threshold:
+            
+    #         print(pair, contributions[pair[1]].item())
+    #         relevant_contributions.append(contributions[pair[1]].item())
+
     if len(relevant_contributions) > 0:
         max_contribution = max(relevant_contributions)
     else:

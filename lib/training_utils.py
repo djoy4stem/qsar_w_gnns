@@ -301,7 +301,8 @@ class GNNTrainer(object):
 
                 # Check if trial should be pruned based on intermediate results
                 if trial.should_prune():
-                    tboard_writer.add_text(f"Trial_{trial.number}/Status", "Pruned", epoch)
+                    if not tboard_writer is None:
+                        tboard_writer.add_text(f"Trial_{trial.number}/Status", "Pruned", epoch)
                     raise TrialPruned()
 
 

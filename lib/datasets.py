@@ -66,6 +66,26 @@ def split_data(
     return train_data, val_data, test_data
 
 
+class CustomBatch(Batch):
+    @staticmethod
+    def from_data_list(data_list):
+        
+        # Create the batch using the parent method
+        batch = super(CustomBatch, CustomBatch).from_data_list(data_list)
+
+        if hasattr(batch, 'global_feats'):
+            # print(sum([d.global_feats.shape[0] for d in data_list]))
+            # Concatenate all `global_feats` attributes as a 2D tensor
+            if data_list[0].global_feats.ndim>1:
+                global_feats = cat([data.global_feats for data in data_list], dim=0)
+            elif data_list[0].global_feats.ndim==1:
+                global_feats = cat([data.global_feats.unsqueeze(0) for data in data_list], dim=0)
+            # print("GF", global_feats.shape)
+
+            # Add the `global_feats` as a 2D tensor
+            batch.global_feats = global_feats
+        return batch
+
 ## Custom PyTorch Collate Function: https://lukesalamone.github.io/posts/custom-pytorch-collate/
 class CustomCollater:
     def __init__(self, follow_batch=[]):

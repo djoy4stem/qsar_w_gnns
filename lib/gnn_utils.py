@@ -86,9 +86,15 @@ def graph_from_molecule(
                 bond_features.append(bond_featurizer.encode(bond))
 
         if add_global_feat_to_nodes:
-            atom_features = [
-                np.array(af.tolist() + mol_features[0]) for af in atom_features
-            ]
+            # print("mol_features: ", mol_features)
+            if isinstance(mol_features[0], (list, int, float)):
+                atom_features = [
+                    np.array(af.tolist() + [mol_features[0]]) for af in atom_features
+                ]
+            else:
+                atom_features = [
+                    np.array(af.tolist() + mol_features[0]) for af in atom_features
+                ]   
             mol_features = None
         else:
             # print("mol_features", mol_features)
@@ -448,10 +454,10 @@ def clean_features_from_data_and_batch(
 
         elif isinstance(data, batch):
             # Flatten and assign back
-            print(
-                "tensor(global_feats_reshaped).view(-1)",
-                tensor(global_feats_reshaped).view(-1),
-            )
+            # print(
+            #     "tensor(global_feats_reshaped).view(-1)",
+            #     tensor(global_feats_reshaped).view(-1),
+            # )
             cleaned_data.global_feats = torch.as_tensor(global_feats_reshaped).view(-1)
 
     if add_global_feats_to_nodes:

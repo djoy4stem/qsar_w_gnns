@@ -98,6 +98,7 @@ class MyGNN(nn.Module):
 
         self.set_global_pooling_func(gpooling_func)
         self.init_type = init_type
+        self.can_use_edge_attr=False
 
         # self.classification_out_layer = None
         # self.regression_out_layer     = None
@@ -321,6 +322,7 @@ class GCN(MyGNN):
 
         # print('global_feats is None ', global_feats is None)
         # print(x.shape, edge_index.shape)
+        # print(self.conv1)
         x = self.conv1(x, edge_index)
         x = self.activation_func(x)
         # print(f'after conv1: {x is None}')
@@ -348,6 +350,9 @@ class GCN(MyGNN):
             # print(f"self.global_pooling(x,batch): {self.global_pooling(x,batch).shape}\n\tglobal_feats = {global_feats.shape}")
             # print(self.global_pooling(x,batch).dtype, global_feats.dtype)
             if not self.global_pooling is None:
+                if global_feats.ndim==1:
+                    global_feats = global_feats.unsqueeze(0)
+
                 all_feats = cat(
                     [self.global_pooling(x, batch), global_feats], dim=1
                 ).float()
@@ -457,6 +462,8 @@ class GAT(MyGNN):
 
         self.set_global_pooling_func(gpooling_func)
         self.add_batch_norm = add_batch_norm
+
+        self.can_use_edge_attr=True
 
         self.create_layers()
         self.initialize_params(init_type=self.init_type)
@@ -660,19 +667,21 @@ class GAT(MyGNN):
         if global_feats is None:
             ## This is applicable if we do not have global (molecule) features or they have already been added to
             ## each node of the respective molecules
-            # print(self.global_pooling(x,dbatch).shape)
+            # print(self.global_pooling(x,batch).shape)
             x = self.ffn(global_mean_pool(x, batch))
             # print('After global_mean_pool', x.shape)
         else:
             ## This is applicable if the global (molecule) features have been computed, but not been added
             ## to the node features. Here, the node features are transformed to a vector, which is then
             ## condatenated with the global features
-            # print(self.global_pooling(x,dbatch).shape, global_feats.shape)
+            # print(self.global_pooling(x,batch).shape, global_feats.shape)
             # print(self.global_pooling(x,dbatch).dtype, global_feats.dtype)
             # print(self.global_pooling(x,dbatch).to(dtype=torch.float64).dtype)
             # print(global_feats.to(dtype=torch.float64).dtype)
 
             # x = self.ffn(cat([self.global_pooling(x,dbatch).to(dtype=torch.float64), global_feats.to(dtype=torch.float64)], dim=1)) #.float()
+            if global_feats.ndim==1:
+                global_feats = global_feats.unsqueeze(0)
             all_feats = cat(
                 [self.global_pooling(x, batch), global_feats], dim=1
             ).float()
@@ -902,9 +911,11 @@ class GIN(MyGNN):
             x = gconvo(x, edge_index)
 
         x = self.global_pooling(x, batch)
-
+        # print('global_feats', global_feats.shape)
         if not global_feats is None:
             # print('global_feats', global_feats.shape)
+            if global_feats.ndim==1:
+                global_feats = global_feats.unsqueeze(0)
             x = cat((x, global_feats), dim=1).to(dtype=torch.float)
 
         # print('x', x.shape, x.dtype)

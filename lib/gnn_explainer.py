@@ -12,6 +12,7 @@ from matplotlib import pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
 
+from torch import Tensor
 from torch_geometric.data import Data
 from torch_geometric.explain import Explainer, GNNExplainer
 from torch_geometric.utils import k_hop_subgraph, remove_self_loops, to_networkx
@@ -196,13 +197,23 @@ class GNNExplainerModule:
     ) -> None:
         """Visualizes the explanations of GNNExplainer for a graph given a mask threshold."""
         device = device or self.device
-        explanation = self.explainer(
-            x=my_data.x.to(device),
-            edge_index=my_data.edge_index.to(device),
-            batch=my_data.to(device).batch,
-            global_feats=my_data.to(device).to_dict().get("global_feats", None),
-        )
+        # print("\n\nmy_data.to(device).to_dict()", my_data)
 
+        if self.gnn_predictor.model.can_use_edge_attr:
+            explanation = self.explainer(
+                x=my_data.x.to(device),
+                edge_index=my_data.edge_index.to(device),
+                batch=my_data.to(device).batch,
+                global_feats=my_data.to(device).to_dict().get("global_feats", None),
+                edge_attr=my_data.to(device).to_dict().get("edge_attr", None)
+            )
+        else:
+            explanation = self.explainer(
+                x=my_data.x.to(device),
+                edge_index=my_data.edge_index.to(device),
+                batch=my_data.to(device).batch,
+                global_feats=my_data.to(device).to_dict().get("global_feats", None)
+            )
         edge_mask = explanation.edge_mask
         # print("edge_mask = ", edge_mask)
 
@@ -224,12 +235,22 @@ class GNNExplainerModule:
             remove_self_loops=remove_self_loops,
         )
 
+        # print(f"pred: {pred} - {pred.__class__}")
+        prediction_ = None
+        if isinstance(pred, Tensor):
+            prediction_ = pred.item()
+        elif isinstance(pred, (list, np.ndarray)):
+            prediction_ = pred[0][0]
+
         if "y" in my_data:
             # label =
+
+
             self.visualize_subgraph(
                 graph=graph,
                 edge_set=edge_set,
-                title=f"GNNExplainer on graph : label = {my_data.y.item()}, pred = {pred[0][0]:.2f}",
+                
+                title=f"GNNExplainer on graph : label = {my_data.y.item()}, pred = {prediction_ :.2f}",
                 node_size=node_size,
                 edge_width=edge_width,
             )
@@ -237,7 +258,7 @@ class GNNExplainerModule:
             self.visualize_subgraph(
                 graph=graph,
                 edge_set=edge_set,
-                title=f"GNNExplainer on graph : pred = {pred[0][0]:.2f}",
+                title=f"GNNExplainer on graph : pred = {prediction_ :.2f}",
                 node_size=node_size,
                 edge_width=edge_width,
             )
@@ -395,9 +416,19 @@ class GNNExplainerModule:
                 to_undirected=True,
                 remove_self_loops=True,
             )
+            # print(data)
+            global_feats=data.to_dict().get('global_feats', None)
+            if not global_feats is None:
+                # global_feats = global_feats.view(1,-1)
+                global_feats = global_feats.unsqueeze(0)
+
+                print("global_feats", global_feats.shape)
+            
             subgraph = subgraphx.explain(
                 x=data.x.to(device),
                 edge_index=data.edge_index.to(device),
+                global_feats=global_feats,
+                edge_attr=data.to_dict().get('edge_attr', None),
                 max_nodes=num_nodes,
             )
 

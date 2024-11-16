@@ -32,5 +32,5 @@ Covered topics include, among others:
 1. [Scaffold Splitting](./notebooks/dd2/dd2_gcn_classification.ipynb)
 2. [Cluster-Based Splitting](./notebooks/dd2/dd2_gin_classification.ipynb)
 
-### Visualizing Training Progress
+### Visualizing Training Progress and Metrics
 1. [Tensorboard]((./notebooks/dd2/dd2_gin_classification.ipynb))
